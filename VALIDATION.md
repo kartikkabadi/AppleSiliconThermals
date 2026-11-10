@@ -16,6 +16,21 @@
   failed commits, schema migration and strict malformed-profile rejection.
 - Script syntax, Python compilation, manifest validation, sudoers parsing and
   diff checks pass. Independent review found no remaining blocker.
+- Production commit `ab9137d` passed GitHub Actions on both Ubuntu targets:
+  https://github.com/kartikkabadi/AppleSiliconThermals/actions/runs/42802306084
+- Installed the schema 3 broker and exact-token policy. Setup backed up the
+  existing preference and preserved the active Linked/Max request (6241 RPM,
+  hardware-clamped to 5779/6241).
+- Recovered the known earlier Separate pair (2300/2500) into inactive memory
+  using the installed broker's lock, validators and atomic preference writer.
+  Existing nonempty memory would have been left intact. Active mode, RPM,
+  generation and hardware targets were unchanged by this metadata migration.
+- Updated the live plugin and restarted the shell, then restarted the supervisor.
+  The same active Linked/Max request, generation and remembered Separate pair
+  survived. Final supervisor status was ready/manual, with no preference error,
+  pause or control error. The new `separate` token passed a read-only sudo probe.
+- No physical reboot/suspend or live Separate-speed test was performed; cold
+  boot and target restoration are covered by isolated fixtures and QML flow tests.
 - No additional executable paths, file paths or unbounded arguments are exposed
   through the single-account sudo policy.
 

@@ -75,8 +75,11 @@ class InstallationBoundaryTests(unittest.TestCase):
         return os.stat_result(fields)
 
     def verify(self, path, directory=False, private_config=False):
-        with mock.patch.object(os, 'lstat', lambda path, *args, **kwargs: self.metadata(self.real_lstat, path, *args, **kwargs)), \
-                mock.patch.object(os, 'stat', lambda path, *args, **kwargs: self.metadata(self.real_stat, path, *args, **kwargs)):
+        # Pathlib 3.10 caches OS accessors, whereas newer versions look them
+        # up dynamically. Patch the Path seam so the same ownership simulation
+        # reaches the production guard on every supported Python version.
+        with mock.patch.object(Path, 'lstat', lambda path, *args, **kwargs: self.metadata(self.real_lstat, path, *args, **kwargs)), \
+                mock.patch.object(Path, 'stat', lambda path, *args, **kwargs: self.metadata(self.real_stat, path, *args, **kwargs)):
             return self.namespace['verify_install_destination'](path, directory=directory, private_config=private_config)
 
     def directory(self, name, mode=0o755):

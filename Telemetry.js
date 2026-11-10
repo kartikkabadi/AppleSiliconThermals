@@ -50,6 +50,8 @@ function parse(raw) {
     var min = number(data.fan_min, 1000, 7999), max = number(data.fan_max, 1000, 7999)
     var error = boundedText(data.error, 80)
     var saved = savedTargets(data.saved_fans)
+    var separateMemory = data.separate_memory === true
+    var memory = separateMemory ? savedTargets(data.saved_separate_fans) : {valid: true, fans: []}
     var savedMode = data.saved_mode === "auto" || data.saved_mode === "manual" ? data.saved_mode : "unknown"
     var savedControlMode = ["auto", "shared", "individual"].indexOf(data.saved_control_mode) >= 0 ? data.saved_control_mode : "unknown"
     var savedRpm = integer(data.saved_rpm, 1000, 7999)
@@ -57,6 +59,10 @@ function parse(raw) {
     var preferenceValid = saved.valid && (savedMode === "auto" && savedControlMode === "auto" && saved.fans.length === 0 && data.saved_rpm === null
         || savedMode === "manual" && (savedControlMode === "shared" && saved.fans.length === 0 && savedRpm !== null
             || savedControlMode === "individual" && data.saved_rpm === null && exactMap && fans.length > 0))
+    var memoryInventoryMatches = memory.fans.length === fans.length && fans.every(function(fan) { return memory.fans.some(function(target) { return target.index === fan.index }) })
+    var memoryMatchesActive = savedControlMode !== "individual" || memory.fans.length === saved.fans.length && saved.fans.every(function(fan) { return memory.fans.some(function(target) { return target.index === fan.index && target.rpm === fan.rpm }) })
+    var memoryValid = memory.valid && (!separateMemory || memoryMatchesActive)
+    preferenceValid = preferenceValid && memoryValid
     return {isAppleSilicon: data.is_apple_silicon === true, hasFan: data.has_fan === true,
         deviceModel: boundedText(data.device_model, 128), fans: fans, fanCount: fans.length,
         fanRpm: number(data.fan_rpm, 0, 100000), fanTarget: number(data.fan_target, 0, 100000),
@@ -77,6 +83,10 @@ function parse(raw) {
         savedFansValid: saved.valid,
         preferenceValid: preferenceValid,
         perFanControl: data.per_fan_control === true,
+        separateMemory: separateMemory,
+        savedSeparateFans: memory.fans,
+        separateMemoryValid: memoryValid,
+        separateRestoreAvailable: memoryValid && (memory.fans.length === 0 || memoryInventoryMatches),
         savedOwnerUid: integer(data.saved_owner_uid, 0, 4294967295),
         pausedReason: boundedText(data.paused_reason, 240),
         preferenceError: boundedText(data.preference_error, 240),

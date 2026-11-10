@@ -236,6 +236,55 @@ class TelemetryTests(unittest.TestCase):
             self.assertEqual(thermal.main(['set-fan', '2', '4500']), 0)
         self.assertEqual(run.call_args.args[0], ['/usr/bin/sudo', '-n', str(thermal.BROKER), 'fan', '2', '4500'])
 
+    def test_separate_profile_cli_uses_one_exact_broker_token(self):
+        with patch.object(thermal, 'trusted_broker', return_value=True), \
+                patch.object(thermal, 'command_result', return_value={'ok': True, 'data': {'mode': 'manual'}}) as run, \
+                patch('builtins.print'):
+            self.assertEqual(thermal.main(['set-separate']), 0)
+        self.assertEqual(run.call_args.args[0], ['/usr/bin/sudo', '-n', str(thermal.BROKER), 'separate'])
+        for argv in (['set-separate', 'extra'], ['set-separate', '4000'], ['set-separate;id'], ['set', 'separate']):
+            with self.subTest(argv=argv), patch('builtins.print'):
+                self.assertEqual(thermal.main(argv), 64)
+
+    def test_separate_memory_is_bounded_and_independent_of_current_shared_target(self):
+        self.fan()
+        self.fan(2, maximum=6241)
+        memory = [{'index': 2, 'rpm': 2502}, {'index': 1, 'rpm': 2300}]
+        result = self.reader.get({**self.control('manual'), 'persistent': True, 'per_fan_control': True,
+                                  'separate_memory': True, 'saved_mode': 'manual', 'saved_control_mode': 'shared',
+                                  'saved_rpm': 4000, 'saved_fans': [], 'saved_separate_fans': memory})
+        self.assertTrue(result['separate_memory'])
+        self.assertEqual(result['saved_rpm'], 4000)
+        self.assertEqual(result['saved_separate_fans'], list(reversed(memory)))
+        self.assertTrue(result['fan_control_enabled'])
+
+    def test_invalid_claimed_separate_memory_fails_numeric_closed(self):
+        self.fan()
+        for memory in (None, {}, [{'index': 1, 'rpm': 4000.5}], [{'index': 1, 'rpm': 4000}] * 2,
+                       [{'index': 65, 'rpm': 4000}], [{'index': 1, 'rpm': '4000'}]):
+            with self.subTest(memory=memory):
+                result = self.reader.get({**self.control('manual'), 'per_fan_control': True,
+                                          'separate_memory': True, 'saved_separate_fans': memory})
+                self.assertFalse(result['per_fan_control'])
+                self.assertFalse(result['fan_control_enabled'])
+                self.assertTrue(result['control_available'])
+                self.assertTrue(result['preference_error'])
+
+    def test_legacy_separate_capability_cannot_be_inferred_from_an_optional_field(self):
+        self.fan()
+        result = self.reader.get({**self.control('manual'), 'saved_separate_fans': [{'index': 1, 'rpm': 4000}]})
+        self.assertFalse(result['separate_memory'])
+        self.assertEqual(result['saved_separate_fans'], [])
+
+    def test_inactive_inventory_mismatch_does_not_break_shared_control(self):
+        self.fan()
+        result = self.reader.get({**self.control('manual'), 'per_fan_control': True,
+                                  'separate_memory': True, 'saved_mode': 'manual', 'saved_control_mode': 'shared',
+                                  'saved_rpm': 4000, 'saved_fans': [],
+                                  'saved_separate_fans': [{'index': 2, 'rpm': 4500}]})
+        self.assertTrue(result['fan_control_enabled'])
+        self.assertIsNone(result['preference_error'])
+
     def test_control_command_errors_and_invalid_json(self):
         for program in ['print("not json")', 'print("[]")', 'raise SystemExit(2)', 'print("x"*20000)']:
             with self.subTest(program=program):
@@ -292,6 +341,23 @@ class TelemetryTests(unittest.TestCase):
             result = thermal.broker_status()
         self.assertTrue(result['per_fan_control'])
         self.assertEqual(commands[1][-3:], ['fan', '2', '1000'])
+
+    def test_separate_permission_upgrade_is_read_only_and_preserves_auto(self):
+        commands = []
+        def check(command, **_kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 1 if command[-1] == 'separate' else 0)
+        reply = {'ok': True, 'data': {'schema_version': 1, 'mode': 'manual', 'ready': True,
+                                     'per_fan_control': True, 'separate_memory': True, 'saved_separate_fans': []}}
+        with patch.object(thermal, 'trusted_broker', return_value=True), \
+                patch.object(thermal, 'command_result', return_value=reply), \
+                patch.object(thermal.subprocess, 'run', side_effect=check):
+            result = thermal.broker_status()
+        self.assertTrue(result['permitted'])
+        self.assertTrue(result['separate_memory'])
+        self.assertFalse(result['per_fan_control'])
+        self.assertIn('Separate-profile permission', result['error'])
+        self.assertEqual(commands[-1], ['/usr/bin/sudo', '-n', '-l', str(thermal.BROKER), 'separate'])
 
 
 if __name__ == '__main__':

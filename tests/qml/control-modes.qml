@@ -49,10 +49,14 @@ Scope {
                 stage = 4
             } else if (stage === 4) {
                 check(widget.savedControlMode === "shared" && widget.savedRpm === 2502 && !widget.separateControls, "Linked synchronizes to exact highest target without lowering")
+                widget.setSpeed(4000)
+                stage = 40
+            } else if (stage === 40) {
+                check(widget.savedRpm === 4000 && widget.savedSeparateFans[0].rpm === 2300 && widget.savedSeparateFans[1].rpm === 2502, "changing Linked does not overwrite remembered Separate speeds")
                 recreate()
                 stage = 5
             } else if (stage === 5) {
-                check(widget.savedControlMode === "shared" && widget.savedRpm === 2502 && !widget.separateControls, "Linked survives recreation without a new write")
+                check(widget.savedControlMode === "shared" && widget.savedRpm === 4000 && !widget.separateControls, "Linked survives recreation without a new write")
                 var linked = find(widget, "linked-fan-controls", [])
                 var separate = find(widget, "fan-control-1", [])
                 check(linked && separate && linked.snap(linked.maximum * 0.25) === 1550 && separate.snap(separate.maximum * 0.25) === 1450, "Linked and Separate use their correct distinct preset ranges")
@@ -65,35 +69,45 @@ Scope {
                 check(!widget.pendingRequests.some(function(request) { return request.kind === "shared" }), "hidden Linked release cannot undo Separate")
                 stage = 6
             } else if (stage === 6) {
-                check(widget.savedControlMode === "individual" && widget.fanSelected(widget.fans[0]) === 2502 && widget.fanSelected(widget.fans[1]) === 2502, "Separate preserves an exact non-step shared target")
+                check(widget.savedControlMode === "individual" && widget.fanSelected(widget.fans[0]) === 2300 && widget.fanSelected(widget.fans[1]) === 2502, "Separate restores both remembered unequal exact targets")
                 recreate()
                 stage = 7
             } else if (stage === 7) {
                 check(widget.separateControls && widget.savedControlMode === "individual", "Separate survives recreation without a new write")
-                widget.setSpeed(4000)
+                widget.setFan(1, 1600)
+                widget.setFan(2, 5000)
                 stage = 8
             } else if (stage === 8) {
-                widget.setFan(1, 1600) // In flight; queued Shared is then canceled.
                 widget.chooseControlMode("shared")
-                widget.chooseControlMode("individual")
                 stage = 9
             } else if (stage === 9) {
-                check(widget.savedControlMode === "individual" && widget.fanSelected(widget.fans[0]) === 1600 && widget.fanSelected(widget.fans[1]) === 4000, "canceled Linked target cannot leak into Separate")
-                widget.setFan(2, 5000)
+                check(widget.savedRpm === 5000 && widget.savedSeparateFans[0].rpm === 1600 && widget.savedSeparateFans[1].rpm === 5000, "Linked retains a distinct remembered Separate profile")
+                widget.setSpeed(4000)
                 stage = 10
             } else if (stage === 10) {
-                var separateSlider = find(find(widget, "fan-control-1", []), "fan-target-slider", [])
-                separateSlider.dragging = true
-                separateSlider.liveValue = 4321
-                widget.setFan(1, 1200)
-                widget.setFan(2, 1200) // Pending lower preview must not hide saved 5000.
+                var linkedSlider = find(find(widget, "linked-fan-controls", []), "linked-target-slider", [])
+                linkedSlider.dragging = true
+                linkedSlider.liveValue = 4321
+                widget.chooseControlMode("individual")
+                check(widget.fanSelected(widget.fans[1]) === 5000, "active Separate previews remembered targets before acknowledgment")
+                check(!linkedSlider.dragging && linkedSlider.liveValue === linkedSlider.value, "hiding Linked resets its stale gesture")
+                linkedSlider.released(5500)
+                widget.setFan(2, 3500) // This pending edit will be canceled by Linked.
                 widget.chooseControlMode("shared")
-                check(!separateSlider.dragging && separateSlider.liveValue === separateSlider.value, "hiding Separate cancels its drag state")
-                separateSlider.released(2300)
-                check(!widget.pendingRequests.some(function(request) { return request.kind === "fan" }), "hidden Separate release cannot undo Linked")
                 stage = 11
             } else if (stage === 11) {
-                check(widget.savedControlMode === "shared" && widget.savedRpm === 5000 && !widget.separateControls, "Linked protects observed/saved highest target when pending edits are lower")
+                check(widget.savedControlMode === "shared" && widget.savedRpm === 5000 && !widget.separateControls, "Linked protects active restored 5000 from a canceled lower preview")
+                widget.setSpeed(4000) // Keep a Shared command active while both edits queue.
+                widget.chooseControlMode("individual")
+                check(widget.fanSelected(widget.fans[0]) === 1600 && widget.fanSelected(widget.fans[1]) === 5000, "pending Separate previews the complete remembered profile")
+                widget.setFan(2, 3500)
+                check(widget.pendingRequests.some(function(request) { return request.kind === "separate" }) && widget.pendingRequests.some(function(request) { return request.kind === "fan" }), "fan edit keeps the earlier queued restore")
+                stage = 42
+            } else if (stage === 42) {
+                check(widget.savedControlMode === "individual" && widget.fanSelected(widget.fans[0]) === 1600 && widget.fanSelected(widget.fans[1]) === 3500, "fan edits after Separate remain ordered and update memory")
+                widget.chooseControlMode("shared")
+                stage = 43
+            } else if (stage === 43) {
                 widget.setSpeed("auto")
                 widget.chooseControlMode("individual")
                 stage = 12
@@ -115,5 +129,5 @@ Scope {
             }
         }
     }
-    Timer { interval: 10000; running: true; onTriggered: { console.error("ASSERT FAILED: layout mode sequence timed out at stage " + stage); Qt.quit() } }
+    Timer { interval: 11000; running: true; onTriggered: { console.error("ASSERT FAILED: layout mode sequence timed out at stage " + stage); Qt.quit() } }
 }

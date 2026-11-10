@@ -530,6 +530,50 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         self.assertEqual(self.profile_bytes(), before)
         self.assertIn('inventory', broker.load_state()['error'])
 
+    def test_concurrent_shared_and_separate_mode_commands_keep_the_remembered_map(self):
+        self.use_real_fixture_hardware()
+        with mock.patch.object(broker, 'owner_uid', return_value=1000):
+            broker.command('fan', fan_index=1, fan_rpm=1600)
+            broker.command('fan', fan_index=2, fan_rpm=5000)
+        memory = [{'index': 1, 'rpm': 1600}, {'index': 2, 'rpm': 5000}]
+        mutex = threading.Lock()
+        barrier = threading.Barrier(2)
+        failures = []
+        original_load = broker.load_preference
+        def delayed_load():
+            preference = original_load()
+            time.sleep(0.01)
+            return preference
+        def choose(action):
+            try:
+                barrier.wait(timeout=2)
+                broker.command(action)
+            except Exception as error:
+                failures.append(error)
+        with mock.patch.object(broker, 'locked', lambda: mutex), \
+                mock.patch.object(broker, 'owner_uid', return_value=1000), \
+                mock.patch.object(broker, 'load_preference', delayed_load):
+            threads = [threading.Thread(target=choose, args=(action,), daemon=True)
+                       for action in ('4500', 'separate')]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(failures, repr(failures))
+        preference, error = broker.load_preference()
+        self.assertIsNone(error)
+        self.assertEqual(preference['separate_fans'], memory)
+        if preference['control_mode'] == 'individual':
+            self.assertEqual(preference['fans'], memory)
+            self.assertEqual((self.hw / 'fan1_target').read_text(), '1600')
+            self.assertEqual((self.hw / 'fan2_target').read_text(), '5000')
+        else:
+            self.assertEqual(preference['control_mode'], 'shared')
+            self.assertEqual(preference['rpm'], 4500)
+            self.assertEqual((self.hw / 'fan1_target').read_text(), '4500')
+            self.assertEqual((self.hw / 'fan2_target').read_text(), '4500')
+
     def test_schema1_reads_migrate_without_modifying_the_legacy_file(self):
         import json
         path = self.persistence / 'preference.json'
@@ -537,7 +581,7 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         before = path.read_bytes()
         preference, error = broker.load_preference()
         self.assertIsNone(error)
-        self.assertEqual(preference['schema_version'], 2)
+        self.assertEqual(preference['schema_version'], 3)
         self.assertEqual(preference['control_mode'], 'shared')
         self.assertEqual(preference['rpm'], 4000)
         self.assertEqual(preference['fans'], [])

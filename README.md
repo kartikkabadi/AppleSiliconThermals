@@ -8,8 +8,9 @@ supervised hardware override.
 This fork builds on [LukasMoriarty/AppleSiliconThermals](https://github.com/LukasMoriarty/AppleSiliconThermals)
 and retains its MIT license. Version 2 replaces the original shell telemetry and
 unbounded manual override with validated JSON and supervised fan control.
-Version 2.3 lets you choose linked or separate fan sliders, with remembered RPM
-and control layout across bar restarts and reboot. Version 2.1 shared settings
+Version 2.4 keeps your separate fan speeds saved while you use Linked, and
+restores them when you return to Separate. Your settings and layout survive
+bar restarts and reboot. Version 2.1 shared settings
 migrate without losing the saved choice.
 
 ## Requirements and support
@@ -102,11 +103,15 @@ for new manual settings: one slider and Quiet/Balanced/Max presets adjust both
 fans, clamped to each fan's hardware limits. Choose Separate for an individual
 slider and presets on each fan card. Adjusting one fan preserves the others.
 Switching to Linked uses the highest current target so no fan slows down;
-switching to Separate keeps the current targets. Your selected layout is saved
-with the manual targets and restored across shell restart and reboot.
+switching back to Separate restores the last individual targets you saved.
+Changing the Linked slider or presets does not replace that remembered pair.
+If you have never used Separate, its first selection starts from the current
+per-fan targets. Your selected layout and the remembered separate speeds are
+saved by the root service across shell restart and reboot. Auto pauses manual
+control while retaining the inactive Separate profile.
 
-The root control
-service maintains it independently of the widget and restores it after service
+The root control service maintains these settings independently of the widget
+and restores the active choice after service
 restart, shell restart, login and reboot. Closing the popup or disabling the
 widget does not change the saved choice. Choose **Auto** to save automatic
 firmware control instead. A reboot begins with an automatic reset, then applies
@@ -118,8 +123,8 @@ The preference is an atomic, root-owned JSON file at:
 /var/lib/apple-silicon-fan-control/preference.json
 ```
 
-The file records mode, a requested RPM per fan index, and the requesting account. It does not
-contain executable code or arbitrary paths. Writes include file and directory
+The file records mode, active targets, the remembered Separate targets, and the
+requesting account. It does not contain executable code or arbitrary paths. Writes include file and directory
 synchronization so an acknowledged choice is durable. Runtime state under
 `/run` is separate; discarding runtime state does not discard your preference.
 The popup distinguishes your saved choice from the current hardware mode. A
@@ -127,18 +132,27 @@ safety pause retains the choice and explains why it is temporarily inactive.
 
 ### Upgrading existing saved settings
 
-A version 2.1 preference is read as a shared setting without rewriting its file.
+Version 2.1/2.2/2.3 preferences migrate on read without rewriting their files.
+An active older Separate map also becomes the remembered Separate profile;
+an older Linked preference has no stored Separate history to recover.
+Schema 3 writes happen only after an explicit user setting change.
 The first individual adjustment captures the detected fan inventory and the
 other fans' desired, clamped targets, then saves the complete independent map.
 Numeric `helper.sh set <RPM>` remains available as a shared compatibility action;
-`helper.sh set-fan <index> <RPM>` changes one channel. The root interface accepts
-only indices 1–64 and bounded numeric RPM, never paths or executable arguments.
+`helper.sh set-fan <index> <RPM>` changes one channel.
+`helper.sh set-separate` restores the remembered Separate profile in one verified
+transaction, rather than applying a partial sequence of fan edits. The root
+interface accepts only indices 1–64 and bounded numeric RPM, never paths or executable arguments.
 
 Independent maps must match the detected inventory exactly. Missing or newly
 appeared fans pause the saved setting rather than applying another channel's
 RPM. Select Auto, then configure the available fans again after a hardware
 inventory change. Changing hardware limits replans the actual clamp while
-retaining the originally requested RPM in the saved preference.
+retaining the originally requested RPM in the saved preference. An inactive
+Separate profile with a different fan inventory does not disrupt Linked control;
+restoring it is refused instead of applying its speeds to different channels.
+From Linked or Auto, an explicit `set-fan` edit starts a new map from the current
+fan inventory if you need to replace an obsolete Separate profile.
 
 ### Hardware control and recovery
 

@@ -1,3 +1,26 @@
+# Version 2.4 remembered Separate profile — 10 November 2026
+
+- Schema 3 stores inactive Separate targets independently of the active Linked
+  target. Shared presets and explicit Auto preserve that remembered map.
+- The bounded `separate` action restores the whole map in one locked, verified
+  transaction. With no prior profile, it captures current per-fan setpoints.
+- Schema 1/2 preferences migrate on read without file writes; an older active
+  individual map also supplies its remembered profile.
+- An inactive profile with a changed fan inventory does not disrupt Linked
+  control. Restoring it fails without partial application or channel remapping.
+- All 160 Python tests and 29 JavaScript tests pass locally. Python includes
+  five control QML cases and the rendered icon-motion case.
+- Memory regressions cover unequal targets through Linked changes and widget
+  recreation, exact non-step RPM, queued restore followed by a fan edit, quick
+  toggle cancellation, Auto precedence, cold boot and service/sleep recovery,
+  failed commits, schema migration and strict malformed-profile rejection.
+- Script syntax, Python compilation, manifest validation, sudoers parsing and
+  diff checks pass. Independent review found no remaining blocker.
+- No additional executable paths, file paths or unbounded arguments are exposed
+  through the single-account sudo policy.
+
+---
+
 # Version 2.3 linked controls and icon polish — 10 November 2026
 
 - Linked manual controls provide one slider and Quiet/Balanced/Max presets.

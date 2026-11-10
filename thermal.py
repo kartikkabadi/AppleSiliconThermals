@@ -134,6 +134,16 @@ def broker_status() -> dict:
                 env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             pass
+    separate_permitted = False
+    if permitted and data.get('separate_memory') is True:
+        try:
+            separate_permitted = subprocess.run(
+                ['/usr/bin/sudo', '-n', '-l', str(BROKER), 'separate'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=1, check=False,
+                env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     error = data.get('error')
     if not ready and not error:
         error = 'Manual-control watchdog is not ready.'
@@ -141,8 +151,10 @@ def broker_status() -> dict:
         error = 'This user is not authorized for manual control.'
     elif ready and data.get('per_fan_control') is True and not per_fan_permitted:
         error = 'Per-fan permission is not installed. Update the control service setup.'
+    elif ready and data.get('separate_memory') is True and not separate_permitted:
+        error = 'Separate-profile permission is not installed. Update the control service setup.'
     return {**data, 'mode': mode if ready else 'unknown', 'ready': ready,
-            'per_fan_control': per_fan_permitted,
+            'per_fan_control': per_fan_permitted and (data.get('separate_memory') is not True or separate_permitted),
             'permitted': permitted, 'error': str(error)[:1024] if error else None}
 
 
@@ -195,6 +207,13 @@ class Telemetry:
         if saved_fans is None:
             saved_fans = []
             preference_error = preference_error or 'Control service returned an invalid saved fan map.'
+        separate_memory = control.get('separate_memory') is True
+        separate_fans = saved_fan_map(control.get('saved_separate_fans')) if separate_memory else []
+        if separate_fans is None:
+            separate_fans = []
+            preference_error = preference_error or 'Control service returned an invalid remembered separate profile.'
+        if separate_memory and saved_mode == 'manual' and saved_control_mode == 'individual' and separate_fans != saved_fans:
+            preference_error = preference_error or 'Active separate targets do not match the remembered separate profile.'
         paused = None
         if persistent and saved_mode == 'manual' and mode != 'manual':
             paused = control.get('paused_reason') or control.get('pause_reason') or control.get('error')
@@ -208,6 +227,7 @@ class Telemetry:
             'persistent': persistent, 'saved_mode': saved_mode, 'saved_rpm': saved_rpm,
             'per_fan_control': control.get('per_fan_control') is True and preference_error is None,
             'saved_fans': saved_fans, 'saved_control_mode': saved_control_mode,
+            'separate_memory': separate_memory, 'saved_separate_fans': separate_fans,
             'control_mode': control_mode,
             'saved_owner_uid': saved_owner, 'requested_rpm': requested_rpm,
             'paused_reason': paused,
@@ -256,7 +276,7 @@ class Telemetry:
                                         ('fan_min', 'min', min), ('fan_max', 'max', max)):
             values = [f[fan_key] for f in fans if f[fan_key] is not None]
             data[key] = aggregate(values) if values else None
-        data['fan_control_enabled'] = bool(available and fans and all(f['limits_valid'] for f in fans))
+        data['fan_control_enabled'] = bool(available and not preference_error and fans and all(f['limits_valid'] for f in fans))
         for path in sorted(files):
             match = re.fullmatch(r'temp([0-9]{1,3})_label', path.name)
             if not match:
@@ -293,19 +313,21 @@ def main(argv: list[str]) -> int:
     is_set = len(argv) == 2 and argv[0] == 'set' and ACTION.fullmatch(argv[1])
     is_set_fan = (len(argv) == 3 and argv[0] == 'set-fan' and FAN_INDEX.fullmatch(argv[1])
                   and re.fullmatch(r'[1-7][0-9]{3}', argv[2]))
+    is_set_separate = argv == ['set-separate']
     is_heartbeat = len(argv) == 2 and argv[0] == 'heartbeat' and re.fullmatch(r'[0-9a-f]{32}', argv[1])
-    if is_set or is_set_fan or is_heartbeat:
+    if is_set or is_set_fan or is_set_separate or is_heartbeat:
         if not trusted_broker():
             print(json.dumps({'ok': False, 'error': 'The trusted manual-control service is not installed.'}))
             return 1
-        arguments = [argv[1]] if is_set else ['fan', argv[1], argv[2]] if is_set_fan else ['heartbeat', argv[1]]
+        arguments = (['separate'] if is_set_separate else [argv[1]] if is_set
+                     else ['fan', argv[1], argv[2]] if is_set_fan else ['heartbeat', argv[1]])
         response = command_result(['/usr/bin/sudo', '-n', str(BROKER), *arguments], 3.5)
         if response['ok']:
             print(json.dumps(response['data'], allow_nan=False))
             return 0
         print(json.dumps({'ok': False, 'error': response['error']}, ensure_ascii=True))
         return 1
-    print(json.dumps({'ok': False, 'error': 'Usage: helper.sh get | set <auto|RPM> | set-fan <index> <RPM> | heartbeat <lease-id>'}))
+    print(json.dumps({'ok': False, 'error': 'Usage: helper.sh get | set <auto|RPM> | set-fan <index> <RPM> | set-separate | heartbeat <lease-id>'}))
     return 64
 
 

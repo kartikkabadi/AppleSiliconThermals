@@ -43,6 +43,9 @@ BarWidget {
     property string savedControlMode: "unknown"
     property bool savedPreferenceValid: false
     property bool perFanControl: false
+    property bool separateMemory: false
+    property var savedSeparateFans: []
+    property bool separateRestoreAvailable: true
     property string manualControlChoice: ""
     property string pausedReason: ""
     property string preferenceError: ""
@@ -116,6 +119,9 @@ BarWidget {
             savedControlMode = data.savedControlMode
             savedPreferenceValid = data.preferenceValid
             perFanControl = data.perFanControl
+            separateMemory = data.separateMemory
+            savedSeparateFans = data.savedSeparateFans
+            separateRestoreAvailable = data.separateRestoreAvailable
             pausedReason = data.pausedReason
             preferenceError = data.preferenceError
             if (data.error) {
@@ -171,12 +177,18 @@ BarWidget {
     function fanSelected(fan) {
         for (var pending = pendingRequests.length - 1; pending >= 0; pending--) {
             var request = pendingRequests[pending]
+            if (request.kind === "separate") {
+                for (var memory = 0; memory < savedSeparateFans.length; memory++) if (savedSeparateFans[memory].index === fan.index) return clampFanSpeed(fan, savedSeparateFans[memory].rpm)
+            }
             if (request.kind === "shared") return clampFanSpeed(fan, Number(request.args[1]))
             if (request.kind === "fan" && Number(request.args[1]) === fan.index) return clampFanSpeed(fan, Number(request.args[2]))
         }
         if (writeBusy && writeProc.activeRequest && writeProc.activeRequest.kind === "fan" && Number(writeProc.activeRequest.args[1]) === fan.index)
             return clampFanSpeed(fan, Number(writeProc.activeRequest.args[2]))
         if (writeBusy && writeProc.activeRequest && writeProc.activeRequest.kind === "shared") return clampFanSpeed(fan, Number(writeProc.activeRequest.args[1]))
+        if (writeBusy && writeProc.activeRequest && writeProc.activeRequest.kind === "separate") {
+            for (var activeMemory = 0; activeMemory < savedSeparateFans.length; activeMemory++) if (savedSeparateFans[activeMemory].index === fan.index) return clampFanSpeed(fan, savedSeparateFans[activeMemory].rpm)
+        }
         if (savedControlMode === "individual") {
             for (var i = 0; i < savedFans.length; i++) if (savedFans[i].index === fan.index) return clampFanSpeed(fan, savedFans[i].rpm)
         }
@@ -189,9 +201,11 @@ BarWidget {
     }
     function highestDesiredSpeed() {
         var highest = fanMin
+        var restoringSeparate = (writeBusy && writeProc.activeRequest && writeProc.activeRequest.kind === "separate") || pendingRequests.some(function(request) { return request.kind === "separate" })
         for (var i = 0; i < fans.length; i++) {
             var fan = fans[i]
             var values = [fan.target, fanSelected(fan)]
+            if (restoringSeparate) for (var remembered = 0; remembered < savedSeparateFans.length; remembered++) if (savedSeparateFans[remembered].index === fan.index) values.push(savedSeparateFans[remembered].rpm)
             if (savedControlMode === "shared") values.push(savedRpm)
             else for (var j = 0; j < savedFans.length; j++) if (savedFans[j].index === fan.index) values.push(savedFans[j].rpm)
             for (var k = 0; k < values.length; k++) {
@@ -209,10 +223,12 @@ BarWidget {
     function chooseControlMode(choice) {
         if (!fanControlEnabled || !dataValid || autoPending() || (choice !== "shared" && choice !== "individual")) return
         if ((choice === "individual") === separateControls) return
+        if (choice === "individual" && separateMemory && !separateRestoreAvailable) { controlError = strings.t("separateMemoryMismatch"); return }
         var transfer = highestDesiredSpeed()
         manualControlChoice = choice
         pendingRequests = pendingRequests.filter(function(request) { return request.kind === "auto" })
         if (choice === "shared") setSpeed(transfer)
+        else if (separateMemory) enqueue({kind:"separate",key:"separate",args:["set-separate"]})
         else if (fans.length) {
             var firstTarget = fanSelected(fans[0])
             if (firstTarget !== null) setFan(fans[0].index, firstTarget, true)
@@ -222,7 +238,7 @@ BarWidget {
         if (request.kind === "auto") pendingRequests = [request]
         else {
             if (autoPending()) return
-            var queue = pendingRequests.filter(function(previous) { return previous.key !== request.key && (request.kind !== "shared" || previous.kind !== "fan") && (request.kind !== "fan" || previous.kind !== "shared") })
+            var queue = pendingRequests.filter(function(previous) { return request.kind !== "separate" && previous.key !== request.key && (request.kind !== "shared" || (previous.kind !== "fan" && previous.kind !== "separate")) && (request.kind !== "fan" || previous.kind !== "shared") })
             queue.push(request)
             pendingRequests = queue
         }
@@ -253,7 +269,8 @@ BarWidget {
     function enableManual() {
         if (!fanControlEnabled || autoPending()) return
         if (desiredManual) return
-        if (manualControlChoice === "individual" && fans.length) setFan(fans[0].index, fanSelected(fans[0]), true)
+        if (manualControlChoice === "individual" && separateMemory) enqueue({kind:"separate",key:"separate",args:["set-separate"]})
+        else if (manualControlChoice === "individual" && fans.length) setFan(fans[0].index, fanSelected(fans[0]), true)
         else setSpeed(highestDesiredSpeed())
     }
     function retainAutoRecovery() {
@@ -354,11 +371,13 @@ BarWidget {
                         var reply = JSON.parse(writeProc.output)
                         var checked = Telemetry.parse(JSON.stringify({is_apple_silicon:true,has_fan:root.fans.length > 0,fans:root.fans,
                             persistent:reply.persistent,saved_mode:reply.saved_mode,saved_rpm:reply.saved_rpm,
-                            saved_fans:reply.saved_fans,saved_control_mode:reply.saved_control_mode}))
+                            saved_fans:reply.saved_fans,saved_control_mode:reply.saved_control_mode,
+                            separate_memory:reply.separate_memory,saved_separate_fans:reply.saved_separate_fans}))
                         if (writeProc.activeRequest.kind !== "auto" && (reply.persistent !== true || !checked.preferenceValid)) throw new Error("Invalid saved fan targets")
                         var request = writeProc.activeRequest
                         if (request.kind === "fan" && (checked.savedControlMode !== "individual" || !checked.savedFans.some(function(fan) { return fan.index === Number(request.args[1]) && fan.rpm === Number(request.args[2]) }))) throw new Error("Fan target was not acknowledged")
                         if (request.kind === "shared" && (checked.savedControlMode !== "shared" || checked.savedRpm !== Number(request.args[1]))) throw new Error("Shared target was not acknowledged")
+                        if (request.kind === "separate" && (!checked.separateMemory || checked.savedControlMode !== "individual" || !checked.separateMemoryValid)) throw new Error("Remembered separate profile was not acknowledged")
                         if (request.kind === "auto" && checked.preferenceValid && checked.savedMode !== "auto") throw new Error("Automatic mode was not acknowledged")
                         if (reply.persistent === true && checked.preferenceValid) {
                             root.persistentControl = true
@@ -367,6 +386,9 @@ BarWidget {
                             root.savedFans = checked.savedFans
                             root.savedControlMode = checked.savedControlMode
                             root.savedPreferenceValid = true
+                            root.separateMemory = checked.separateMemory
+                            root.savedSeparateFans = checked.savedSeparateFans
+                            root.separateRestoreAvailable = checked.separateRestoreAvailable
                         } else root.savedPreferenceValid = false // Auto recovery works with older brokers too.
                     } catch (error) {
                         root.manualControlChoice = ""
@@ -511,7 +533,7 @@ BarWidget {
                                 width: parent.width
                                 spacing: Style.space(6)
                                 Button { width: (parent.width - parent.spacing) / 2; text: strings.t("linked"); iconText: "󰌷"; focusable: true; selected: !root.separateControls; enabled: root.fanControlEnabled; onClicked: root.chooseControlMode("shared") }
-                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("separate"); iconText: "󰕮"; focusable: true; selected: root.separateControls; enabled: root.fanControlEnabled; onClicked: root.chooseControlMode("individual") }
+                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("separate"); iconText: "󰕮"; focusable: true; selected: root.separateControls; enabled: root.fanControlEnabled && (!root.separateMemory || root.separateRestoreAvailable); onClicked: root.chooseControlMode("individual") }
                             }
                         }
                         LinkedFanControls {
@@ -530,6 +552,8 @@ BarWidget {
                             onTargetRequested: function(rpm) { root.setSpeed(rpm) }
                         }
                         ThermalText { width: parent.width; visible: root.desiredManual && root.preferenceConfirmed; text: "✓ " + strings.t(root.separateControls ? "rememberedIndependent" : "remembered"); color: Commons.Color.muted }
+                        ThermalText { width: parent.width; visible: root.desiredManual && root.fanCount > 1 && !root.separateMemory; text: strings.t("separateMemoryUnsupported"); color: Commons.Color.muted }
+                        ThermalText { width: parent.width; visible: root.desiredManual && root.separateMemory && !root.separateRestoreAvailable; text: strings.t("separateMemoryMismatch"); color: Commons.Color.muted }
                         ThermalText { width: parent.width; visible: !root.desiredManual && root.mode === "auto"; text: strings.t("automaticNote"); color: Commons.Color.muted }
                         ThermalText { width: parent.width; visible: !root.persistentControl || !root.controlAvailable; text: strings.t(root.persistentControl ? "controlUnavailable" : "setup"); color: Commons.Color.muted }
                         ThermalText { width: parent.width; visible: root.pausedReason !== ""; text: root.pausedReason; color: Commons.Color.urgent }

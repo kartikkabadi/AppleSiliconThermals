@@ -119,6 +119,68 @@ test('saved requests above a current hardware maximum remain valid desired value
   assert.equal(data.preferenceValid, true);
   assert.equal(data.savedFans.find(fan => fan.index === 1).rpm, 6241);
 });
+test('remembered Separate map is retained independently of active Linked and Auto modes', () => {
+  const saved_separate_fans = [{index: 2, rpm: 5000}, {index: 1, rpm: 1600}];
+  for (const active of [{saved_mode: 'auto', saved_control_mode: 'auto', saved_rpm: null},
+                       {saved_mode: 'manual', saved_control_mode: 'shared', saved_rpm: 4000}]) {
+    const data = parse({...active, separate_memory: true, saved_separate_fans});
+    assert.equal(data.separateMemory, true);
+    assert.equal(data.separateMemoryValid, true);
+    assert.equal(data.separateRestoreAvailable, true);
+    assert.equal(data.preferenceValid, true);
+    assert.equal(data.controlEnabled, true);
+    assert.equal(data.savedSeparateFans.find(fan => fan.index === 1).rpm, 1600);
+    assert.equal(data.savedSeparateFans.find(fan => fan.index === 2).rpm, 5000);
+  }
+});
+test('inactive remembered inventory mismatch leaves Linked valid but disables restoration', () => {
+  const data = parse({saved_mode: 'manual', saved_control_mode: 'shared', saved_rpm: 4000,
+    separate_memory: true, saved_separate_fans: [{index: 1, rpm: 1600}, {index: 3, rpm: 5000}]});
+  assert.equal(data.separateMemoryValid, true);
+  assert.equal(data.separateRestoreAvailable, false);
+  assert.equal(data.preferenceValid, true);
+  assert.equal(data.controlEnabled, true);
+  assert.equal(data.savedControlMode, 'shared');
+  assert.equal(data.savedRpm, 4000);
+});
+test('claimed remembered profiles with malformed data fail closed', () => {
+  const malformed = [undefined, null, {}, 'targets', [{index: 1, rpm: 1600}, {index: 1, rpm: 5000}],
+    [{index: 1.5, rpm: 1600}], [{index: '1', rpm: 1600}], [{index: 0, rpm: 1600}],
+    [{index: 65, rpm: 1600}], [{index: 1, rpm: 1600.5}], [{index: 1, rpm: '1600'}],
+    [{index: 1, rpm: 999}], [{index: 1, rpm: 8000}],
+    Array.from({length: 65}, (_, i) => ({index: i + 1, rpm: 1600}))];
+  for (const saved_separate_fans of malformed) {
+    const data = parse({separate_memory: true, saved_separate_fans});
+    assert.equal(data.separateMemoryValid, false);
+    assert.equal(data.separateRestoreAvailable, false);
+    assert.equal(data.preferenceValid, false);
+    assert.equal(data.controlEnabled, false);
+  }
+});
+test('active Separate preferences must agree with remembered values by index', () => {
+  const saved_fans = [{index: 1, rpm: 1600}, {index: 2, rpm: 5000}];
+  const active = {saved_mode: 'manual', saved_control_mode: 'individual', saved_fans, separate_memory: true};
+  const good = parse({...active, saved_separate_fans: [...saved_fans].reverse()});
+  assert.equal(good.separateMemoryValid, true);
+  assert.equal(good.preferenceValid, true);
+  for (const saved_separate_fans of [[], [{index: 1, rpm: 1600}, {index: 2, rpm: 4000}]]) {
+    const data = parse({...active, saved_separate_fans});
+    assert.equal(data.separateMemoryValid, false);
+    assert.equal(data.preferenceValid, false);
+    assert.equal(data.controlEnabled, false);
+  }
+});
+test('empty remembered history can seed a profile and unclaimed support is never fabricated', () => {
+  const empty = parse({separate_memory: true, saved_separate_fans: []});
+  assert.equal(empty.separateMemoryValid, true);
+  assert.equal(empty.separateRestoreAvailable, true);
+  for (const separate_memory of [false, undefined, 'true', 1]) {
+    const data = parse({separate_memory, saved_separate_fans: 'untrusted legacy field'});
+    assert.equal(data.separateMemory, false);
+    assert.equal(data.savedSeparateFans.length, 0);
+    assert.equal(data.preferenceValid, true);
+  }
+});
 test('fanless/error states cannot enable numeric controls', () => {
   assert.equal(parse({has_fan: false}).controlEnabled, false);
   assert.equal(parse({fans: [], has_fan: false}).controlEnabled, false);

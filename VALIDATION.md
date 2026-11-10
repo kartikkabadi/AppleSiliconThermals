@@ -37,6 +37,21 @@ Validation:
 - Shell syntax, Python compilation, manifest validation, sudoers parsing,
   structural systemd unit checks and diff checks pass. The new path preflight
   and bounded read-only sleep-target query also pass against this live host.
+- GitHub Actions passed on Ubuntu 22.04 and 24.04 at `723e5da`:
+  https://github.com/kartikkabadi/AppleSiliconThermals/actions/runs/42809392644
+  The initial run exposed a Python 3.10 pathlib test-fixture seam, corrected by
+  mocking Path metadata methods consistently across supported Python versions.
+  Production code was unchanged by that fixture correction; Qt cases skip on
+  CI runners without Omarchy, while all ten Qt cases passed on the review host.
+- Installed version 2.5.1, its root-owned post-wake hook and updated sleep unit.
+  Installed broker/hook/unit bytes match the reviewed source. Broker and hook
+  are root:root 0755, sudo policy root:root 0440, preference root:root 0644.
+  Both services remain enabled; the supervisor is active/running with no
+  automatic restarts, pause, preference error or control error.
+- The supervisor and shell restarted successfully. The original preference
+  generation remained unchanged: active Linked/Max request 6241 (hardware
+  targets 5779/6241), remembered Separate targets 2300/2500. No live profile
+  switching, simulated heat, injected driver failure, reboot or sleep was run.
 - Physical suspend/hibernate/reboot and other Mac models remain untested. Their
   state transitions have isolated fixture coverage; that is distinct from a
   physical hardware test. The sensors remain component readings, not CPU/GPU

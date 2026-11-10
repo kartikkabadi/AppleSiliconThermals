@@ -1,0 +1,107 @@
+// Run the actual QML library in a clean JS realm; no GUI or hardware writes.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const test = require('node:test');
+const source = fs.readFileSync(path.join(__dirname, '..', 'Telemetry.js'), 'utf8').replace(/^\.pragma library\s*/, '');
+const context = vm.createContext({});
+vm.runInContext(source, context, {filename: 'Telemetry.js'});
+function fixture(changes = {}) {
+  return {
+    is_apple_silicon: true, has_fan: true, fan_count: 2,
+    device_model: 'Apple MacBook Pro', fan_rpm: 2500, fan_target: 2500,
+    fan_min: 1200, fan_max: 6241, mode: 'unknown',
+    fan_control_enabled: true, control_available: true,
+    fans: [{index: 1, label: 'Fan 1', rpm: 2300, min: 1200, max: 5779, target: 2317},
+           {index: 2, label: 'Fan 2', rpm: 2500, min: 1200, max: 6241, target: 2502}],
+    sensors: {nand: 0, battery: 34.5, regulator: null, wifi: 49},
+    max_temp: 49, power_watts: 0,
+    ...changes,
+  };
+}
+function parse(changes) { return context.parse(JSON.stringify(fixture(changes))); }
+
+test('positive setpoint cannot create manual mode', () => {
+  assert.equal(parse().mode, 'unknown');
+  assert.equal(parse({mode: 'auto'}).mode, 'auto');
+});
+test('valid zeros and missing readings remain distinct', () => {
+  const data = parse({fan_rpm: 0, fan_target: null, max_temp: 0});
+  assert.equal(data.fanRpm, 0); assert.equal(data.fanTarget, null);
+  assert.equal(data.sensors.nand, 0); assert.equal(data.sensors.regulator, null);
+  assert.equal(data.maxTemp, 0); assert.equal(data.powerWatts, 0);
+});
+test('invalid numeric strings are not coerced', () => {
+  const data = parse({fan_rpm: '2500', max_temp: '49', power_watts: '10'});
+  assert.equal(data.fanRpm, null); assert.equal(data.maxTemp, null); assert.equal(data.powerWatts, null);
+});
+test('all reported fan limits must be safe for manual controls', () => {
+  assert.equal(parse().controlEnabled, true);
+  for (const min of [null, 0, 999, 7000]) {
+    const fans = fixture().fans; fans[1].min = min;
+    assert.equal(parse({fans}).controlEnabled, false);
+  }
+  const fans = fixture().fans; fans[1].max = 8000;
+  assert.equal(parse({fans}).controlEnabled, false);
+});
+test('unavailable permission never enables controls', () => {
+  assert.equal(parse({control_available: false}).controlEnabled, false);
+  assert.equal(parse({control_available: 'true'}).controlEnabled, false);
+});
+test('fanless/error states cannot enable numeric controls', () => {
+  assert.equal(parse({has_fan: false}).controlEnabled, false);
+  assert.equal(parse({fans: [], has_fan: false}).controlEnabled, false);
+  assert.equal(parse({error: 'macsmc_hwmon_missing'}).controlEnabled, false);
+});
+test('malformed, duplicated or truncated fan entries disable numeric controls', () => {
+  const valid = fixture().fans[0];
+  for (const fans of [[valid, {index: '2', min: null, max: null}],
+                      [valid, {...valid}],
+                      Array.from({length: 33}, (_, i) => ({...valid, index: i + 1}))]) {
+    assert.equal(parse({fans}).controlEnabled, false);
+  }
+});
+test('invalid aggregate limits disable controls', () => {
+  for (const limits of [{fan_min: null}, {fan_min: 7000}, {fan_max: 8000}, {fan_max: 0}])
+    assert.equal(parse(limits).controlEnabled, false);
+});
+test('unsupported and missing driver replies retain error', () => {
+  const data = context.parse(JSON.stringify({is_apple_silicon: true, error: 'macsmc_hwmon_missing'}));
+  assert.equal(data.error, 'macsmc_hwmon_missing'); assert.equal(data.controlEnabled, false);
+});
+test('malformed protocol objects are rejected', () => {
+  for (const value of ['', 'null', '42', '[]', '{}', '{"is_apple_silicon":"true"}', '{'])
+    assert.throws(() => context.parse(value));
+  assert.throws(() => context.parse(' '.repeat(65537)));
+});
+test('primitive sensor container cannot fabricate zeros', () => {
+  for (const sensors of [0, false, '', null, [], 'temperature']) {
+    const data = parse({sensors});
+    for (const key of ['nand', 'battery', 'regulator', 'wifi']) assert.equal(data.sensors[key], null);
+  }
+});
+test('all numeric validators reject nonfinite and out-of-range inputs', () => {
+  for (const value of [NaN, Infinity, -Infinity, '1', null, true, {}, -1, 100001])
+    assert.equal(context.number(value, 0, 100000), null);
+});
+test('labels are bounded and control characters stripped', () => {
+  assert.equal(context.boundedText('A\u0000\u0001B\u007fC', 20), 'ABC');
+  assert.equal(context.boundedText('a'.repeat(1000), 64).length, 64);
+  assert.equal(context.boundedText({toString: () => 'unsafe'}, 64), '');
+});
+test('markup is neutralized before shared tooltip sinks', () => {
+  const text = context.escapeMarkup('<img src="https://example.invalid/x">&\'');
+  assert.equal(text, '&lt;img src=&quot;https://example.invalid/x&quot;&gt;&amp;&#39;');
+  assert.equal(text.includes('<'), false);
+});
+test('generation is validated without coercion', () => {
+  assert.equal(parse({broker_generation: 'a'.repeat(32), lease_owned: true}).generation, 'a'.repeat(32));
+  for (const value of ['', 'a'.repeat(31), 'A'.repeat(32), '<img>', null, 123])
+    assert.equal(parse({broker_generation: value}).generation, '');
+});
+test('high-index fans remain visible and fan count is derived', () => {
+  const fans = fixture().fans; fans[1].index = 999;
+  const data = parse({fans, fan_count: 9999});
+  assert.equal(data.fanCount, 2); assert.equal(data.fans[1].index, 999);
+});

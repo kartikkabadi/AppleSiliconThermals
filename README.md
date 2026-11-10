@@ -1,122 +1,195 @@
-# AppleSiliconThermals
+# Apple Silicon Thermals
 
-**Hardware thermal monitoring and fan speed control plugin for [Omarchy Linux](https://omarchy.org/) on Apple Silicon MacBooks.**
+An Omarchy bar widget for Apple Silicon Macs running Linux. It reads fan speeds,
+component temperatures and system power directly from `macsmc_hwmon`. Monitoring
+requires no administrator permissions. Manual fan control is an optional,
+supervised hardware override.
 
-This plugin is inspired by the macOS menu bar utility **Stats** (https://mac-stats.com/).
+This fork builds on [LukasMoriarty/AppleSiliconThermals](https://github.com/LukasMoriarty/AppleSiliconThermals)
+and retains its MIT license. Version 2 replaces the original shell telemetry and
+unbounded manual override with validated JSON and expiring control leases.
 
-**AppleSiliconThermals** bridges the Asahi Linux `macsmc_hwmon` kernel driver with the modern Omarchy Quickshell status bar. It provides real-time sensor telemetry, a dynamic status bar indicator with rotational animation, and a popup control panel offering continuous fan curve control and quick presets.
+## Requirements and support
 
----
+- Linux with the `macsmc_hwmon` driver and Python 3.10 or newer at `/usr/bin/python3`.
+- Omarchy's Quickshell shell, with `qs.Ui.PopupCard`, `OpticalGlyph`,
+  `Commons.Translations` and `Commons.I18n`. Tested on Omarchy 4.5.0, Quickshell
+  0.3.2 and Qt 6.12, on a 14-inch 2021 M1 Pro MacBook Pro.
+- Optional manual control additionally needs systemd, sudo 1.9.10 or newer
+  (argument regular expressions), root-owned sysfs controls, and a functioning
+  desktop authentication agent when installing without a terminal.
 
-## Features
+M1/M2 hardware with this driver is the intended platform. Fanless Macs show
+sensor readings without fan controls. Single/multiple fans, different per-fan
+limits, hwmon renumbering, missing sensors and unsupported machines have fixture
+coverage. Other physical models and earlier Omarchy releases have not been
+hardware-tested; missing controls fail closed instead of guessing RPM limits.
 
-- **Dynamic Status Bar Indicator**:
-  - Compact fan icon seamlessly styled with active Omarchy theme tokens.
-  - Dynamically spins smoothly when the fan is active; duration scales proportionally with current RPM.
-  - Thermal color alerts: neutral when cool, warm amber (≥65°C), and urgent red (≥80°C).
-  - Hover tooltip with live RPM and maximum temperature.
+The shown temperatures are NAND, battery hotspot, charge regulator and Wi-Fi/BT
+component readings. They are **not CPU/GPU die temperatures**, and can lag load.
+The maximum is explicitly the maximum of the available component readings.
+Missing readings display as unavailable; zero is a valid reading.
 
-- **Dual-Mode Fan Control (macOS Stats Style)**:
-  - **Automatic Mode**: Relaxes fan management back to Apple's calibrated hardware SMC algorithms.
-  - **Manual Mode**: Precision continuous slider from **1,199 RPM to 7,199 RPM** with 50 RPM quantization snapping to values ending in **49** and **99** for authentic macOS Stats parity.
-  - **Instant Preset Chips**:
-    - `Auto`: Restores automatic SMC hardware management (`0 RPM` idle / dynamic).
-    - `Quiet`: Fixes fan at whisper-quiet **25%** (`1,799 RPM`).
-    - `Regular`: Balanced cooling at **50%** (`3,599 RPM`).
-    - `Max`: High-performance cooling at **100%** (`7,199 RPM`) for compiling, gaming, or heavy workloads.
+## Install monitoring
 
-- **Comprehensive Hardware Telemetry**:
-  - Live Fan Speed (Current RPM, Target RPM, Minimum & Maximum limits).
-  - Component temperatures: **NAND Flash**, **Battery Hotspot**, **Charge Voltage Regulator**, and **Wi-Fi / Bluetooth Module**.
-  - Real-time Total System Power dissipation in Watts (`W`).
-
-- **Zero External Dependencies**:
-  - Communicates directly with the Linux kernel's standard `hwmon` sysfs interface (`macsmc_hwmon`).
-  - No background Python or Node daemons required; lightweight shell backend.
-
----
-
-## Installation
-
-### Option 1: Direct installation with Omarchy CLI
+Install from this fork after reviewing its source:
 
 ```bash
-omarchy plugin add https://github.com/LukasMoriarty/AppleSiliconThermals.git --enable
+omarchy plugin add https://github.com/kartikkabadi/AppleSiliconThermals.git --enable
 ```
 
-### Option 2: Manual clone into plugins directory
+For a local checkout, copy or clone the complete repository to:
+
+```text
+~/.config/omarchy/plugins/io.github.lukasmoriarty.applesiliconthermals/
+```
+
+Then run:
 
 ```bash
-git clone https://github.com/LukasMoriarty/AppleSiliconThermals.git ~/.config/omarchy/plugins/io.github.lukasmoriarty.applesiliconthermals
-omarchy plugin enable io.github.lukasmoriarty.applesiliconthermals right
+omarchy plugin enable io.github.lukasmoriarty.applesiliconthermals --section right
 ```
 
----
+Do not install both upstream and this fork: the plugin ID is intentionally the
+same so an existing installation can be upgraded. Back up the existing checkout
+and `~/.config/omarchy/shell.json` before replacing it. The shell hot-reloads
+plugin files. An existing legacy root helper must be upgraded separately using
+the optional setup below; installing the bar widget does not execute root code.
 
-## One-Time Setup for Manual Fan Control
+Use the popup to view each fan's actual speed, target and hardware limits.
+Monitoring-only installations display the fan mode as **unknown** because the
+kernel does not expose the SMC mode. A positive target RPM is not evidence of
+manual operation. The supervised service reports its last successful Auto reset
+or its own active manual lease; it cannot prove what an unrelated fan tool does
+later. Run only one fan-control system at a time.
 
-By default, the Linux kernel's `macsmc_hwmon` driver operates in read-only safe mode where the hardware SMC handles 100% of cooling decisions. Live telemetry (temperatures, power, live RPM) functions out of the box with zero setup.
+## Optional manual control
 
-To unlock manual fan speed regulation, install the root-owned broker helper and bounded sudoers policy using standard system installation commands:
+The Linux kernel marks manual fan control unsafe: a safe overheating outcome
+cannot be guaranteed for every failure. The safeguards here reduce particular
+failure modes; they do not make peripheral sensors a substitute for processor
+thermal management. Keep automatic firmware cooling for normal use.
+
+From the reviewed checkout, run **as your normal desktop user**:
 
 ```bash
-cd ~/.config/omarchy/plugins/io.github.lukasmoriarty.applesiliconthermals
-sudo install -Dm755 system/apple-silicon-fan-control /usr/local/libexec/apple-silicon-fan-control
-sudo install -Dm440 system/apple-silicon-fan-control.sudoers /etc/sudoers.d/apple-silicon-fan-control
-sudo install -Dm644 system/macsmc-fan.conf /etc/tmpfiles.d/macsmc-fan.conf
-sudo systemd-tmpfiles --create /etc/tmpfiles.d/macsmc-fan.conf
+./setup.sh --enable-manual-control
 ```
 
-### Security Architecture
+Do not use `sudo ./setup.sh`. The installer copies the broker and service units
+into root-owned locations with standard `install` commands. It starts the
+watchdog, verifies that an automatic reset succeeded, then grants only the
+installing account passwordless access to the bounded broker actions. Other
+local accounts do not receive this permission. Interactive terminals use sudo;
+noninteractive callers first try `sudo -n`, then use `pkexec` only when sudo
+requires authentication. A command that ran and failed is not retried.
 
-- **Root-Owned & Non-User-Writable**: The helper resides in `/usr/local/libexec/apple-silicon-fan-control` (`0755 root:root`). No code is ever executed as root from user-writable directories.
-- **Narrow Validated Interface**: The helper only accepts a single validated action matching `^(auto|[1-7][0-9]{3})$` with strict bounds checking (1,199 to 7,199 RPM). Environment variables (`PATH`, `IFS`, `LD_PRELOAD`) are sanitized.
-- **Strict Sudoers Matching**: The sudoers rule in `/etc/sudoers.d/apple-silicon-fan-control` uses an exact POSIX Extended Regular Expression with zero wildcards:
-  ```sudoers
-  ALL ALL=(root) NOPASSWD: /usr/local/libexec/apple-silicon-fan-control ^(auto|[1-7][0-9]{3})$
-  ```
-- **Root-Owned Sysfs Registers**: Hardware registers remain strictly root-owned (`root:root`) with non-world-writable permissions.
+The installer requires Python, systemd and a regex-capable sudoers parser.
+Installation can fail after creating root files, for example if hardware reset
+fails; the account permission is granted only after the service is ready.
+Resolve the reported error before retrying, or use the uninstall procedure.
 
----
+### How manual control works
 
-## Uninstallation & Removal
+- Numeric requests are limited to four-digit RPM values from 1000 through 7999.
+  The broker clamps the request separately to each fan's hardware minimum and
+  maximum. The UI disables manual controls for incompatible/missing limits.
+- This is a fixed target, **not a temperature-driven curve**. Quiet and Regular
+  derive from 25%/50% of the highest detected fan maximum; each fan is clamped
+  independently. Maximum uses the real detected maximum.
+- The root broker serializes all operations with a lock and validates all fans
+  before a manual write. A partial failure attempts automatic recovery for all
+  fans. If recovery fails, state remains unknown and further manual requests
+  are refused until recovery succeeds.
+- Each manual request creates a new 12-second lease tied to the caller UID and
+  a random generation ID. Only the initiating widget renews that exact lease,
+  every 3 seconds. Removing the widget, shell failure, read failure or a stale
+  generation stops renewal.
+- A separate root watchdog checks every 2 seconds. It releases expired leases,
+  invalid or hot component readings (80 C), and changed hardware targets.
+  Firmware/another tool changing targets is treated as an override, not fought
+  with repeated low-speed writes.
+- systemd monitors the watchdog with an 8-second watchdog timeout and restarts
+  it after failure. Stop/failure handling attempts Auto. This cannot guarantee
+  recovery if the kernel, systemd or hardware itself is unresponsive.
+- A sleep guard inhibits requests before suspend and attempts Auto. Resume
+  must successfully restore Auto before new manual requests are accepted.
+  Lease expiry uses a boot-specific clock that includes time spent suspended.
+- Auto first writes a valid per-fan maximum, then zero, to force the kernel's
+  cached mode through a known transition. This can briefly increase fan speed.
+  The workaround has fixture coverage; real suspend/resume testing is still
+  required on each kernel/model.
 
-To remove the plugin from your Omarchy bar:
+Root paths are fixed. The privileged program accepts no alternate sysfs roots
+or executable paths from arguments/environment. Status reads root-owned state
+without sudo. The policy grants no `watchdog`, `sleep` or `resume` actions to the
+user. Runtime JSON is bounded and published atomically under `/run`.
+
+## Settings and accessibility
+
+Set `"spinIcon": false` in this widget's `bar.layout` entry in
+`~/.config/omarchy/shell.json` to disable the fan animation. The animation also
+follows Omarchy's reduce-motion preference. The popup scrolls to fit smaller
+screens; it supports Escape and focusable controls. English strings are in
+`i18n/en.json`; the selected Omarchy language falls back to English until its
+catalog is supplied. Sensor/model names are displayed as plain text.
+
+## Recovery after a failed sleep reset
+
+If a hardware error prevents the sleep guard from restoring Auto, it deliberately
+keeps manual requests inhibited. After fixing the cause, an administrator can
+retry the protected recovery:
+
+```bash
+sudo /usr/local/libexec/apple-silicon-fan-control resume
+```
+
+It restores Auto before clearing the guard. Ordinary user Auto cannot clear the
+sleep guard because that would reopen the race with an in-progress suspend.
+
+## Remove
+
+If optional control was installed, **release cooling before removing the
+widget or its broker**:
+
+```bash
+./uninstall.sh
+```
+
+This restores Auto, stops/disables the services, restores Auto again and then
+removes the root helper, policy and service files. It refuses to remove the
+helper if the release command fails. It does not remove the bar widget itself.
+If Auto fails, retain the helper, inspect the error and restore known-good
+cooling before removing the control mechanism.
+
+Then:
 
 ```bash
 omarchy plugin disable io.github.lukasmoriarty.applesiliconthermals
 omarchy plugin remove io.github.lukasmoriarty.applesiliconthermals
 ```
 
-To remove the root-owned helper and system configurations:
+For a monitoring-only install, only the two Omarchy commands are necessary.
+
+## Development and verification
+
+No Python packages or downloaded runtime binaries are needed.
 
 ```bash
-sudo rm -f /usr/local/libexec/apple-silicon-fan-control \
-           /etc/sudoers.d/apple-silicon-fan-control \
-           /etc/tmpfiles.d/macsmc-fan.conf
+python3 -m unittest discover -s tests -v
+node --test tests/test_telemetry.cjs
+bash -n helper.sh setup.sh uninstall.sh
+python3 -m py_compile thermal.py system/apple-silicon-fan-control
 ```
 
----
+Python tests use isolated temporary sysfs/runtime fixtures and do not require
+root or write host fan settings. JavaScript tests validate the QML parser,
+malformed data and markup neutralization. CI runs these on Ubuntu 22.04/24.04.
+The same Python command also runs two headless QML integration tests when
+Omarchy UI modules and Quickshell are installed; otherwise those two tests skip.
 
-## Hardware Compatibility & Community Testing
-
-This plugin is purpose-built for Apple Silicon hardware running Linux. It dynamically adapts its UI depending on the detected Mac model and available cooling architecture:
-
-| Hardware Category | Models | Supported Features | Status |
-| :--- | :--- | :--- | :--- |
-| **MacBook Pro** | 13" M1 (2020), 14"/16" M1/M2 Pro & Max | Live telemetry, spinning fan icon, continuous slider & presets | **Verified & Tested** |
-| **MacBook Air** | 13"/15" M1 / M2 | Live component thermals & power; adapts to fanless mode (`󰔏` icon) | **Supported** |
-| **Mac mini** | M1 / M2 / M2 Pro | Full fan control & thermal monitoring (Single fan) | **Community Testing** |
-| **Mac Studio** | M1/M2 Max & Ultra | Synchronous dual-fan control & telemetry | **Call for Testing** |
-| **Mac Pro** | M2 Ultra | Synchronous multi-fan control & telemetry | **Call for Testing** |
-| **iMac** | 24" M1 (2-port & 4-port) | Single / dual-fan control & telemetry | **Call for Testing** |
-| **Non-Apple / x86** | Standard PCs, VMs, Intel/AMD | Inactive warning icon (`󰌺`) & unsupported hardware notice | **Handled / Inactive** |
-
-> **Do you own a Mac Studio, Mac mini, Mac Pro, or iMac?**
-> Feedback is much appreciated! Please [open an issue](https://github.com/LukasMoriarty/AppleSiliconThermals/issues) with your hardware details and test results to help refine multi-fan curves and fan channel independence.
-
----
-
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
+Actual manual writes, lease expiry and suspend/resume are separate hardware
+checks. Passing fixtures or a read-only smoke test is not proof that every Mac,
+kernel and desktop configuration works. Report the model, kernel, Omarchy/Qt
+versions, broker status and relevant service logs when filing an issue; do not
+include credentials or private environment dumps.

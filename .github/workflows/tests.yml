@@ -1,0 +1,34 @@
+name: Safety and regression tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate scripts and compile Python
+        run: |
+          bash -n helper.sh setup.sh uninstall.sh
+          python3 -m py_compile thermal.py system/apple-silicon-fan-control
+      - name: Test isolated hardware fixtures
+        run: python3 -m unittest discover -s tests -v
+      - name: Test telemetry validation and markup handling
+        run: node --test tests/test_telemetry.cjs
+      - name: Validate service units
+        run: |
+          stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
+          # Validate unit structure without installing the root executable.
+          for unit in system/*.service; do
+            sed 's@/usr/local/libexec/apple-silicon-fan-control@/usr/bin/true@g' "$unit" > "$stage/$(basename "$unit")"
+          done
+          systemd-analyze verify "$stage"/*.service

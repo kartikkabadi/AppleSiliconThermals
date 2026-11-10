@@ -1,132 +1,452 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/python3 -I
+"""Root-owned, bounded fan control with an independently supervised lease.
 
-# Secure environment sanitization
-export PATH="/usr/bin:/bin"
-unset IFS LD_PRELOAD LD_LIBRARY_PATH
+Only status is available without root. Production paths are fixed: environment
+variables and command-line arguments cannot redirect privileged filesystem I/O.
+"""
+import contextlib
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import stat
+import sys
+import time
+import uuid
 
-# Enforce root execution
-if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  echo "Error: apple-silicon-fan-control must run as root." >&2
-  exit 1
-fi
+RUNTIME = Path('/run/apple-silicon-fan-control')
+SYSFS = Path('/sys')
+LEASE_SECONDS = 12.0
+WATCHDOG_INTERVAL = 2.0
+WATCHDOG_MAX_AGE = 6.0
+MAX_JSON = 65536
 
-# Strictly enforce exactly one argument
-if [[ $# -ne 1 ]]; then
-  echo "Usage: apple-silicon-fan-control <auto | RPM (clamped to each fan's min..max)>" >&2
-  exit 64
-fi
 
-ACTION="$1"
+def clock():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
 
-# Validate argument: must be 'auto' or a 4-digit RPM (same pattern as the sudoers rule)
-if [[ ! "$ACTION" =~ ^(auto|[1-7][0-9]{3})$ ]]; then
-  echo "Error: Invalid argument '$ACTION'. Must be 'auto' or a 4-digit RPM." >&2
-  exit 2
-fi
 
-# Numeric targets are clamped later to each fan's own hardware min/max, since
-# fans in the same Mac can have different limits (e.g. 14" M1 Pro: 5798 and 6241 RPM).
-TARGET=0
-if [[ "$ACTION" != "auto" ]]; then
-  TARGET=$((10#$ACTION))
-fi
+def boot_id():
+    return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
 
-# Discover macsmc_hwmon
-HWMON_DIR=""
-for d in /sys/class/hwmon/hwmon*; do
-  if [[ -f "$d/name" ]] && [[ "$(< "$d/name")" == "macsmc_hwmon" ]]; then
-    HWMON_DIR="$d"
-    break
-  fi
-done
 
-if [[ -z "$HWMON_DIR" ]]; then
-  echo "Error: macsmc_hwmon not found in sysfs." >&2
-  exit 1
-fi
+def secure_regular(path, writable=False):
+    flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    fd = os.open(path, flags)
+    info = os.fstat(fd)
+    if info.st_uid != 0 or not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
+        os.close(fd)
+        raise RuntimeError('Insecure root-owned file: ' + str(path))
+    return fd
 
-# Ensure target path canonicalizes safely inside /sys
-REAL_HWMON=$(realpath "$HWMON_DIR" 2>/dev/null || true)
-if [[ -z "$REAL_HWMON" || ! "$REAL_HWMON" =~ ^/sys/ ]]; then
-  echo "Security error: macsmc_hwmon path does not resolve inside /sys: $REAL_HWMON" >&2
-  exit 1
-fi
 
-# Ensure kernel fan control parameter is enabled
-FC_PARAM="/sys/module/macsmc_hwmon/parameters/fan_control"
-if [[ -f "$FC_PARAM" ]]; then
-  FC_VAL=$(cat "$FC_PARAM" 2>/dev/null || echo "N")
-  if [[ "$FC_VAL" != "Y" && "$FC_VAL" != "1" ]]; then
-    echo 1 > "$FC_PARAM" 2>/dev/null || true
-  fi
-fi
+def read_json(path):
+    fd = secure_regular(path)
+    with os.fdopen(fd, 'r') as stream:
+        data = stream.read(MAX_JSON + 1)
+    if len(data) > MAX_JSON:
+        raise RuntimeError('Oversized broker state')
+    value = json.loads(data)
+    if not isinstance(value, dict):
+        raise RuntimeError('Invalid broker state')
+    return value
 
-# Find all fan targets
-shopt -s nullglob
-TARGETS=("$REAL_HWMON"/fan*_target)
-shopt -u nullglob
 
-if [[ ${#TARGETS[@]} -eq 0 ]]; then
-  echo "Error: No fan_target registers found in $REAL_HWMON." >&2
-  exit 1
-fi
+def atomic_json(path, data):
+    temp = path.with_name('.' + path.name + '.' + uuid.uuid4().hex)
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(data, stream, allow_nan=False, separators=(',', ':'))
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temp.unlink()
 
-# Pass 1: validate every fan and compute its value before touching any register,
-# so a bad fan never leaves the others half-configured.
-REGS=()
-VALUES=()
-for reg in "${TARGETS[@]}"; do
-  REAL_REG=$(realpath "$reg" 2>/dev/null || true)
-  if [[ -z "$REAL_REG" || ! "$REAL_REG" =~ ^/sys/ ]]; then
-    echo "Security error: Fan target does not resolve inside /sys: $REAL_REG" >&2
-    exit 1
-  fi
-  # Verify root ownership
-  REG_UID=$(stat -c "%u" "$REAL_REG" 2>/dev/null || echo 1)
-  if [[ "$REG_UID" -ne 0 ]]; then
-    echo "Security error: Register $REAL_REG is not owned by root (UID $REG_UID)" >&2
-    exit 1
-  fi
 
-  VALUE=0
-  if (( TARGET > 0 )); then
-    # Clamp to this fan's own hardware limits
-    STEM="${REAL_REG%_target}"
-    MIN=$(cat "${STEM}_min" 2>/dev/null || true)
-    MAX=$(cat "${STEM}_max" 2>/dev/null || true)
-    if [[ ! "$MIN" =~ ^[0-9]+$ || ! "$MAX" =~ ^[0-9]+$ ]] || (( MIN == 0 || MIN > MAX )); then
-      echo "Error: ${STEM}_min/_max are missing or invalid ('$MIN'/'$MAX')." >&2
-      exit 1
-    fi
-    VALUE=$TARGET
-    (( VALUE >= MIN )) || VALUE=$MIN
-    (( VALUE <= MAX )) || VALUE=$MAX
-  fi
+def secure_runtime(create=False):
+    if create:
+        RUNTIME.mkdir(mode=0o755, exist_ok=True)
+    info = RUNTIME.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('Insecure broker runtime directory')
 
-  REGS+=("$REAL_REG")
-  VALUES+=("$VALUE")
-done
 
-# Pass 2: write target RPM (0 for auto, or the clamped RPM)
-SUMMARY=()
-for i in "${!REGS[@]}"; do
-  REAL_REG="${REGS[$i]}"
-  # Strip world-writable bit if present (remedy legacy chmod 0666)
-  chmod o-w "$REAL_REG" 2>/dev/null || true
-  # fan*_target can be exposed read-only (0444), observed with the built-in
-  # macsmc_hwmon driver when fan_control is enabled at runtime via tmpfiles.
-  # kernfs refuses writes to attributes without a write bit, even for root, so
-  # grant owner-only write (root:root, never group/world-writable).
-  chmod u+w,g-w "$REAL_REG" 2>/dev/null || true
+@contextlib.contextmanager
+def locked():
+    secure_runtime(create=True)
+    path = RUNTIME / 'lock'
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != 0 or not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+            raise RuntimeError('Insecure broker lock')
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
-  echo "${VALUES[$i]}" > "$REAL_REG"
-  SUMMARY+=("${REAL_REG##*/}=${VALUES[$i]}")
-done
 
-if (( TARGET == 0 )); then
-  echo "Fan control set to auto (SMC management)"
-else
-  echo "Fan speed set across ${#REGS[@]} fan(s): ${SUMMARY[*]}"
-fi
-exit 0
+class Hardware:
+    def __init__(self):
+        self.root = SYSFS.resolve(strict=True)
+        matches = []
+        for entry in (self.root / 'class/hwmon').glob('hwmon*'):
+            try:
+                name = (entry / 'name').read_text().strip()
+            except OSError:
+                continue
+            if name == 'macsmc_hwmon':
+                resolved = entry.resolve(strict=True)
+                if not resolved.is_relative_to(self.root / 'devices'):
+                    raise RuntimeError('Unexpected macsmc_hwmon path')
+                matches.append(resolved)
+        if len(matches) != 1:
+            raise RuntimeError('Expected exactly one macsmc_hwmon device')
+        self.directory = matches[0]
+        self.fans = []
+        for path in sorted(self.directory.glob('fan*_target')):
+            match = re.fullmatch(r'fan([1-9][0-9]*)_target', path.name)
+            if not match:
+                continue
+            resolved = path.resolve(strict=True)
+            if resolved.parent != self.directory:
+                raise RuntimeError('Fan register escapes hwmon directory')
+            self.fans.append((int(match[1]), resolved))
+        if not self.fans:
+            raise RuntimeError('No controllable fans found')
+
+    def bounds(self, path):
+        stem = path.name.removesuffix('_target')
+        values = []
+        for suffix in ('_min', '_max'):
+            raw = (path.parent / (stem + suffix)).read_text().strip()
+            if not re.fullmatch(r'[0-9]{1,5}', raw):
+                raise RuntimeError('Invalid hardware fan limits')
+            values.append(int(raw))
+        minimum, maximum = values
+        if not 100 <= minimum <= maximum <= 50000:
+            raise RuntimeError('Invalid hardware fan range')
+        return minimum, maximum
+
+    def enable(self):
+        path = self.root / 'module/macsmc_hwmon/parameters/fan_control'
+        fd = secure_regular(path, writable=True)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write('1\n')
+
+    def write(self, path, value):
+        # Runtime enabling does not update hwmon's registration-time file mode.
+        # Change only the canonical root-owned register, never a user path.
+        fd = secure_regular(path)
+        try:
+            os.fchmod(fd, 0o644)
+        finally:
+            os.close(fd)
+        fd = secure_regular(path, writable=True)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(str(value) + '\n')
+
+    def automatic(self):
+        errors = []
+        try:
+            self.enable()
+        except (OSError, RuntimeError) as exc:
+            errors.append('fan control enable: ' + str(exc))
+        for index, path in self.fans:
+            # A nonzero write first forces the driver's cached mode into manual,
+            # so zero subsequently writes the SMC mode even after resume.
+            # Maximum is deliberately used for the short recovery transition.
+            try:
+                _, maximum = self.bounds(path)
+                self.write(path, maximum)
+            except (OSError, RuntimeError) as exc:
+                errors.append('fan%d prime: %s' % (index, exc))
+            try:
+                self.write(path, 0)
+            except (OSError, RuntimeError) as exc:
+                errors.append('fan%d auto: %s' % (index, exc))
+        if errors:
+            raise RuntimeError('; '.join(errors))
+
+    def manual(self, rpm):
+        requests = []
+        # Validate all fans before making the first write.
+        inputs = {int(re.fullmatch(r'fan([1-9][0-9]*)_input', p.name)[1])
+                  for p in self.directory.glob('fan*_input')
+                  if re.fullmatch(r'fan([1-9][0-9]*)_input', p.name)}
+        if inputs != {index for index, _ in self.fans}:
+            raise RuntimeError('Some fans have no controllable target')
+        for index, path in self.fans:
+            minimum, maximum = self.bounds(path)
+            requests.append((index, path, min(maximum, max(minimum, rpm))))
+        self.check_temperatures()
+        self.enable()
+        for _, path, target in requests:
+            self.write(path, target)
+        return [{'index': index, 'target': value} for index, _, value in requests]
+
+    def check_temperatures(self):
+        sensors = list(self.directory.glob('temp*_input'))
+        if not sensors:
+            raise RuntimeError('Temperature monitoring unavailable')
+        for path in sensors:
+            raw = path.read_text().strip()
+            if not re.fullmatch(r'-?[0-9]{1,7}', raw) or not -40000 <= int(raw) < 80000:
+                raise RuntimeError('Temperature invalid or at/above 80 C; releasing to firmware')
+
+    def matches(self, targets):
+        for target in targets:
+            path = self.directory / ('fan%d_target' % target['index'])
+            value = int(path.read_text().strip())
+            if abs(value - target['target']) > 10:
+                return False
+        return True
+
+
+def state_default(error=None):
+    return {'schema_version': 1, 'mode': 'unknown', 'owner_uid': None,
+            'expires_at': 0, 'boot_id': boot_id(), 'generation': uuid.uuid4().hex,
+            'targets': [], 'inhibited': False, 'error': error}
+
+
+def load_state():
+    try:
+        state = read_json(RUNTIME / 'state.json')
+        if state.get('boot_id') != boot_id():
+            return state_default('Broker state belongs to another boot')
+        mode = state.get('mode')
+        expiry = state.get('expires_at')
+        owner = state.get('owner_uid')
+        targets = state.get('targets')
+        if (state.get('schema_version') != 1 or mode not in ('auto', 'manual', 'unknown')
+                or type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry < 0
+                or (owner is not None and (type(owner) is not int or owner < 0))
+                or not re.fullmatch(r'[0-9a-f]{32}', str(state.get('generation', '')))
+                or type(state.get('inhibited')) is not bool
+                or not isinstance(targets, list) or len(targets) > 64
+                or (state.get('error') is not None and not isinstance(state.get('error'), str))):
+            raise RuntimeError('Invalid broker state fields')
+        indices = set()
+        for target in targets:
+            if (not isinstance(target, dict) or type(target.get('index')) is not int
+                    or not 1 <= target['index'] <= 64 or target['index'] in indices
+                    or type(target.get('target')) is not int or not 100 <= target['target'] <= 50000):
+                raise RuntimeError('Invalid broker target state')
+            indices.add(target['index'])
+        if mode == 'manual' and (owner is None or not targets or expiry <= 0):
+            raise RuntimeError('Incomplete manual lease state')
+        return state
+    except (OSError, ValueError, RuntimeError):
+        return state_default('No valid broker state')
+
+
+def watchdog_ready():
+    try:
+        health = read_json(RUNTIME / 'watchdog.json')
+        elapsed = clock() - float(health['updated_at'])
+        return health.get('boot_id') == boot_id() and 0 <= elapsed <= WATCHDOG_MAX_AGE
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+
+
+def status():
+    try:
+        secure_runtime()
+        state = load_state()
+        ready = watchdog_ready()
+        remaining = max(0, float(state.get('expires_at', 0)) - clock())
+        mode = state.get('mode', 'unknown')
+        if mode not in ('auto', 'manual', 'unknown'):
+            mode = 'unknown'
+        if not ready or (mode == 'manual' and remaining <= 0):
+            mode = 'unknown'
+        return {**state, 'mode': mode, 'ready': ready and mode != 'unknown' and not state['inhibited'],
+                'expires_in': round(remaining, 1) if mode == 'manual' else 0,
+                'error': state.get('error') if ready else 'Fan watchdog is not running'}
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return {**state_default('Fan control is not configured'), 'ready': False, 'expires_in': 0}
+
+
+def save(state):
+    atomic_json(RUNTIME / 'state.json', state)
+
+
+def reset(reason=None):
+    inhibited = load_state().get('inhibited', False)
+    state = state_default()
+    state['inhibited'] = inhibited
+    # Prime+zero is also a multi-step change. Persist unknown first so a killed
+    # Auto request is retried instead of leaving an old 'auto' claim behind.
+    try:
+        save(state)
+    except OSError as exc:
+        # Storage trouble must never prevent a best-effort hardware release.
+        print('Cannot journal automatic recovery: ' + str(exc), file=sys.stderr)
+    try:
+        Hardware().automatic()
+        state['mode'] = 'auto'
+        state['error'] = reason
+    except (OSError, ValueError, RuntimeError) as exc:
+        state['error'] = 'Could not restore automatic cooling: ' + str(exc)
+    save(state)
+    return state['mode'] == 'auto'
+
+
+def owner_uid():
+    value = os.environ.get('SUDO_UID', '0')
+    if not re.fullmatch(r'[0-9]{1,10}', value):
+        raise RuntimeError('Invalid calling user')
+    return int(value)
+
+
+def command(action, generation=None):
+    with locked():
+        if action in ('sleep', 'resume'):
+            state = load_state()
+            state['inhibited'] = True
+            save(state)
+            restored = reset()
+            if action == 'resume' and restored:
+                state = load_state()
+                state['inhibited'] = False
+                save(state)
+            if not restored:
+                raise RuntimeError(load_state()['error'])
+            return
+        if action == 'auto':
+            if not reset():
+                raise RuntimeError(load_state()['error'])
+            return
+        # Authorization to request manual control is distinct from the service's
+        # continued liveness. A stopped or stalled watchdog cannot issue leases.
+        if not watchdog_ready():
+            raise RuntimeError('Fan watchdog is not running; manual control refused')
+        uid = owner_uid()
+        state = load_state()
+        if state.get('inhibited'):
+            raise RuntimeError('Fan control is inhibited for sleep or failed resume recovery')
+        if state.get('mode') not in ('auto', 'manual'):
+            raise RuntimeError('Automatic cooling has not been established; manual control refused')
+        if action == 'heartbeat':
+            if (state.get('mode') != 'manual' or state.get('owner_uid') != uid
+                    or generation != state.get('generation')
+                    or float(state.get('expires_at', 0)) <= clock()):
+                raise RuntimeError('No active manual lease belongs to this user')
+            state['expires_at'] = clock() + LEASE_SECONDS
+            save(state)
+            return
+        if state.get('mode') == 'manual' and state.get('owner_uid') != uid:
+            raise RuntimeError('Another user owns the manual fan lease; select Auto first')
+        # Journal a recovery-needed state before touching hardware. If the
+        # final state write fails or this process dies midway, the independent
+        # watchdog sees unknown and retries Auto instead of trusting old state.
+        save(state_default('Manual fan change in progress'))
+        try:
+            targets = Hardware().manual(int(action))
+            state = state_default()
+            state.update(mode='manual', owner_uid=uid, targets=targets,
+                         expires_at=clock() + LEASE_SECONDS)
+            save(state)
+        except (OSError, ValueError, RuntimeError) as exc:
+            reset('Manual control failed: ' + str(exc))
+            raise RuntimeError('Manual control failed; attempted automatic recovery: ' + str(exc)) from exc
+
+
+def watchdog_tick():
+    with locked():
+        state = load_state()
+        if state.get('mode') == 'manual':
+            try:
+                if state.get('inhibited'):
+                    raise RuntimeError('Sleep inhibited manual control')
+                if float(state.get('expires_at', 0)) <= clock():
+                    raise RuntimeError('Manual lease expired')
+                hardware = Hardware()
+                hardware.check_temperatures()
+                if not hardware.matches(state.get('targets', [])):
+                    raise RuntimeError('Firmware or another controller changed fan targets')
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+                reset(str(exc))
+        elif state.get('mode') != 'auto':
+            reset()
+        atomic_json(RUNTIME / 'watchdog.json', {'boot_id': boot_id(), 'updated_at': clock()})
+
+
+def notify_systemd(message):
+    # Only the root systemd service uses this. CLI actions never consume it.
+    address = os.environ.get('NOTIFY_SOCKET')
+    if not address:
+        return
+    if address.startswith('@'):
+        address = '\0' + address[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as connection:
+        connection.connect(address)
+        connection.sendall(message.encode('ascii'))
+
+
+def watchdog():
+    stopping = False
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(signum, stop)
+    with locked():
+        reset()
+    notify_systemd("READY=1")
+    try:
+        while not stopping:
+            watchdog_tick()
+            notify_systemd('WATCHDOG=1')
+            # Keep signal shutdown responsive without busy polling.
+            for _ in range(int(WATCHDOG_INTERVAL * 5)):
+                if stopping:
+                    break
+                time.sleep(0.2)
+    finally:
+        with locked():
+            with contextlib.suppress(FileNotFoundError):
+                (RUNTIME / 'watchdog.json').unlink()
+            reset()
+
+
+def main():
+    os.umask(0o022)
+    if len(sys.argv) < 2:
+        raise RuntimeError('Usage: apple-silicon-fan-control <auto|status|heartbeat TOKEN|RPM>')
+    action = sys.argv[1]
+    generation = None
+    if action == 'heartbeat':
+        if len(sys.argv) != 3 or not re.fullmatch(r'[0-9a-f]{32}', sys.argv[2]):
+            raise RuntimeError('Heartbeat requires the current 32-character lease generation')
+        generation = sys.argv[2]
+    elif len(sys.argv) != 2 or not re.fullmatch(r'auto|status|watchdog|sleep|resume|[1-7][0-9]{3}', action):
+        raise RuntimeError('Invalid fan broker action')
+    if action == 'status':
+        print(json.dumps(status(), allow_nan=False, separators=(',', ':')))
+        return
+    if os.geteuid() != 0:
+        raise RuntimeError('Fan changes require the installed root broker')
+    if action == 'watchdog':
+        watchdog()
+    else:
+        command(action, generation)
+        print(json.dumps(status(), allow_nan=False, separators=(',', ':')))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)

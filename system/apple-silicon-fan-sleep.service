@@ -1,0 +1,14 @@
+[Unit]
+Description=Release Apple Silicon fan override before sleep
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/apple-silicon-fan-control sleep
+ExecStop=/usr/local/libexec/apple-silicon-fan-control resume
+TimeoutStartSec=15
+
+[Install]
+WantedBy=sleep.target

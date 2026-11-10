@@ -1,0 +1,32 @@
+[Unit]
+Description=Apple Silicon fan lease watchdog
+After=systemd-tmpfiles-setup.service
+Before=sleep.target shutdown.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=8s
+TimeoutStartSec=20s
+ExecStart=/usr/local/libexec/apple-silicon-fan-control watchdog
+ExecStopPost=/usr/local/libexec/apple-silicon-fan-control auto
+Restart=always
+RestartSec=1
+TimeoutStopSec=15
+UMask=0022
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/apple-silicon-fan-control /sys
+RuntimeDirectory=apple-silicon-fan-control
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

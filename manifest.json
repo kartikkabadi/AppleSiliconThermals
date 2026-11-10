@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.lukasmoriarty.applesiliconthermals",
   "name": "Apple Silicon Thermals",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "author": "LukasM",
   "license": "MIT",
   "description": "Apple Silicon thermal monitoring with optional supervised manual fan control",

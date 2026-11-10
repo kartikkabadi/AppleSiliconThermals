@@ -80,6 +80,35 @@ class TelemetryTests(unittest.TestCase):
         result = self.reader.get({**self.control(), 'permitted': False})
         self.assertFalse(result['control_available'])
 
+    def test_durable_preference_is_distinct_from_actual_fallback(self):
+        self.fan()
+        control = {**self.control(), 'persistent': True, 'saved_mode': 'manual',
+                   'saved_rpm': 4000, 'saved_owner_uid': os.getuid(),
+                   'requested_rpm': 4000, 'error': 'Temperature guard paused manual control'}
+        result = self.reader.get(control)
+        self.assertEqual(result['mode'], 'auto')
+        self.assertEqual(result['saved_mode'], 'manual')
+        self.assertEqual(result['saved_rpm'], 4000)
+        self.assertTrue(result['persistent'])
+        self.assertIn('Temperature guard', result['paused_reason'])
+
+    def test_invalid_persistent_fields_are_not_coerced(self):
+        self.fan()
+        result = self.reader.get({**self.control('manual'), 'persistent': 'true',
+                                  'saved_mode': 'garbage', 'saved_rpm': '4000',
+                                  'saved_owner_uid': True, 'requested_rpm': float('nan')})
+        self.assertFalse(result['persistent'])
+        self.assertEqual(result['saved_mode'], 'unknown')
+        self.assertIsNone(result['saved_rpm'])
+        self.assertIsNone(result['requested_rpm'])
+        self.assertIsNone(result['saved_owner_uid'])
+
+    def test_legacy_broker_does_not_claim_durable_preference(self):
+        self.fan()
+        result = self.reader.get(self.control('manual'))
+        self.assertFalse(result['persistent'])
+        self.assertEqual(result['saved_mode'], 'unknown')
+
     def test_missing_or_invalid_fan_limits_disable_numeric_control(self):
         self.fan()
         for value in ['missing', 'NaN', '-1', '1000000000000000000', '10000']:
@@ -191,6 +220,20 @@ class TelemetryTests(unittest.TestCase):
         self.write(path, '#!/bin/false')
         path.chmod(0o755)
         self.assertFalse(thermal.trusted_broker(path))
+
+    def test_permission_probe_does_not_require_obsolete_heartbeat_grant(self):
+        commands = []
+        def check(command, **_kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0 if command[-1] == 'auto' else 1)
+        reply = {'ok': True, 'data': {'schema_version': 1, 'mode': 'auto', 'ready': True, 'persistent': True}}
+        with patch.object(thermal, 'trusted_broker', return_value=True), \
+                patch.object(thermal, 'command_result', return_value=reply), \
+                patch.object(thermal.subprocess, 'run', side_effect=check):
+            result = thermal.broker_status()
+        self.assertTrue(result['permitted'])
+        self.assertEqual(commands[0][-1], 'auto')
+        self.assertIn('-l', commands[0])
 
 
 if __name__ == '__main__':

@@ -19,8 +19,8 @@ class WidgetIntegrationTests(unittest.TestCase):
             root = Path(temporary)
             plugin = root / 'Plugin'
             plugin.mkdir()
-            for name in ('BarWidget.qml', 'ThermalText.qml', 'Telemetry.js'):
-                shutil.copy2(REPO / name, plugin / name)
+            for source in [*REPO.glob('*.qml'), REPO / 'Telemetry.js']:
+                shutil.copy2(source, plugin / source.name)
             shutil.copytree(REPO / 'i18n', plugin / 'i18n')
             for name in ('Ui', 'Commons'):
                 (root / name).symlink_to(SHELL / name, target_is_directory=True)
@@ -49,12 +49,16 @@ class WidgetIntegrationTests(unittest.TestCase):
             self.assertNotIn('Failed to load configuration', output, output)
             return (plugin / 'actions.log').read_text() if (plugin / 'actions.log').exists() else ''
 
-    def test_telemetry_command_queue_and_generation(self):
+    def test_telemetry_command_queue_and_saved_intent(self):
         actions = self.run_widget('smoke.qml').splitlines()
         self.assertEqual(actions[:2], ['set 4000', 'set auto'])
         self.assertNotIn('set 4500', actions)
         self.assertNotIn('set 5000', actions)
         self.assertIn('set 4999', actions)
+
+    def test_saved_manual_choice_survives_widget_recreation_without_heartbeat(self):
+        actions = self.run_widget('restart.qml').splitlines()
+        self.assertEqual(actions, ['set 4000'])
 
     def test_missing_executable_recovers_after_install(self):
         self.run_widget('recovery.qml', delayed_helper=True)

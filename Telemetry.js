@@ -6,6 +6,10 @@ function boundedText(value, limit) {
 function number(value, low, high) {
     return typeof value === "number" && isFinite(value) && value >= low && value <= high ? value : null
 }
+function integer(value, low, high) {
+    var parsed = number(value, low, high)
+    return parsed !== null && Math.floor(parsed) === parsed ? parsed : null
+}
 function escapeMarkup(value) {
     return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;")
 }
@@ -40,10 +44,17 @@ function parse(raw) {
         error: error, errorMessage: boundedText(data.error_message, 240),
         warnings: warnings,
         controlError: boundedText(data.control_error, 240),
+        controlNotice: boundedText(data.control_notice, 240),
         generation: /^[0-9a-f]{32}$/.test(data.broker_generation) ? data.broker_generation : "",
         leaseOwned: data.lease_owned === true,
         leaseRecovering: data.lease_recovering === true,
+        persistent: data.persistent === true,
+        savedMode: data.saved_mode === "auto" || data.saved_mode === "manual" ? data.saved_mode : "unknown",
+        savedRpm: integer(data.saved_rpm, 1000, 7999),
+        savedOwnerUid: integer(data.saved_owner_uid, 0, 4294967295),
+        pausedReason: boundedText(data.paused_reason, 240),
+        preferenceError: boundedText(data.preference_error, 240),
         controlAvailable: data.control_available === true,
-        controlEnabled: !error && data.lease_recovering !== true && completeFans && data.control_available === true && data.has_fan === true && data.fan_control_enabled === true && fans.length > 0 && min !== null && max !== null && min <= max
+        controlEnabled: !error && data.persistent === true && data.lease_recovering !== true && completeFans && data.control_available === true && data.has_fan === true && data.fan_control_enabled === true && fans.length > 0 && min !== null && max !== null && min <= max
             && fans.every(function(fan) { return fan.min !== null && fan.max !== null && fan.min <= fan.max && fan.min >= 1000 && fan.max <= 7999 })}
 }

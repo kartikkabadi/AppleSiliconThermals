@@ -111,128 +111,290 @@ class OperatingSystemBoundaryTests(unittest.TestCase):
         self.assertEqual(measurements['count'], 8)
         self.assertEqual(measurements['maximum'], 1)
 
+    def test_atomic_preference_write_syncs_file_before_rename_and_directory_after(self):
+        destination = self.directory / 'preference.json'
+        events = []
+        real_sync = os.fsync
+        real_replace = os.replace
+        def sync(fd):
+            events.append('directory-sync' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file-sync')
+            return real_sync(fd)
+        def replace(source, target):
+            events.append('rename')
+            return real_replace(source, target)
+        with mock.patch.object(broker.os, 'fsync', sync), mock.patch.object(broker.os, 'replace', replace):
+            broker.atomic_json(destination, {'mode': 'auto'})
+        self.assertEqual(events, ['file-sync', 'rename', 'directory-sync'])
+        self.assertEqual(destination.read_text().strip(), '{"mode":"auto"}')
 
-class DriftRepairSafetyTests(unittest.TestCase):
-    """Exercise watchdog policy independently from sysfs/ownership fixtures."""
+    def test_failed_atomic_serialization_preserves_previous_file_and_removes_temp(self):
+        destination = self.directory / 'preference.json'
+        destination.write_text('{"mode":"auto"}')
+        with self.assertRaises(ValueError):
+            broker.atomic_json(destination, {'rpm': float('nan')})
+        self.assertEqual(destination.read_text(), '{"mode":"auto"}')
+        self.assertEqual([path.name for path in self.directory.iterdir()], ['preference.json'])
+
+
+class PersistentIntentSafetyTests(unittest.TestCase):
+    """Real temporary /run and /var/lib data, with hardware operations mocked."""
     def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.runtime = self.root / 'run'
+        self.persistence = self.root / 'var/lib'
+        self.runtime.mkdir()
+        self.persistence.mkdir(parents=True)
         self.now = 100.0
-        self.reacquisitions = []
-        self.auto_resets = 0
-        self.hot = False
-        self.repair_duration = 0
-        self.requested = [{'index': 1, 'target': 4000}, {'index': 2, 'target': 4500}]
-        self.observed = [{'index': 1, 'target': 3000}, {'index': 2, 'target': 3000}]
-        self.state = {
-            'schema_version': 1, 'mode': 'manual', 'owner_uid': 1000,
-            'expires_at': 112.0, 'boot_id': 'fixture-boot', 'generation': 'a' * 32,
-            'targets': copy.deepcopy(self.requested), 'repairs': [],
-            'inhibited': False, 'error': None,
-        }
+        self.current_boot = 'boot-A'
+        self.temperature = 45000
+        self.events = []
+        self.observed = [{'index': 1, 'target': 4000}, {'index': 2, 'target': 4000}]
         self.hardware = mock.Mock()
+        self.hardware.automatic.side_effect = self.automatic
+        self.hardware.manual.side_effect = self.manual
+        self.hardware.reacquire.side_effect = self.reacquire
         self.hardware.check_temperatures.side_effect = self.check_temperatures
         self.hardware.observed_targets.side_effect = lambda: copy.deepcopy(self.observed)
-        # Save references before replacing Hardware with a factory.
-        self.matches = broker.Hardware.matches
-        self.diagnostic = broker.Hardware.target_diagnostic
-        self.hardware.matches.side_effect = lambda requested, observed: self.matches(None, requested, observed)
-        self.hardware.target_diagnostic.side_effect = self.diagnostic
-        self.hardware.reacquire.side_effect = self.reacquire
-        self.hardware.automatic.side_effect = self.automatic
+        matches = broker.Hardware.matches
+        self.hardware.matches.side_effect = lambda requested, observed: matches(None, requested, observed)
+        self.hardware.target_diagnostic.side_effect = broker.Hardware.target_diagnostic
         for name, value in (
-            ('clock', lambda: self.now), ('boot_id', lambda: 'fixture-boot'),
+            ('RUNTIME', self.runtime), ('PERSISTENCE', self.persistence),
+            ('clock', lambda: self.now), ('boot_id', lambda: self.current_boot),
             ('locked', contextlib.nullcontext), ('Hardware', lambda: self.hardware),
-            ('load_state', lambda: copy.deepcopy(self.state)),
-            ('save', self.save), ('atomic_json', lambda *_args: None),
+            ('secure_runtime', lambda create=False: None),
+            ('secure_persistence', lambda create=False: None),
+            ('secure_regular', self.fixture_open),
         ):
             patcher = mock.patch.object(broker, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        self.preference = {'schema_version': 1, 'mode': 'manual', 'rpm': 4000,
+                           'owner_uid': 1000, 'generation': 'a' * 32}
+        broker.save_preference(self.preference)
+        state = broker.state_default()
+        state.update(mode='manual', owner_uid=1000, generation='a' * 32,
+                     requested_rpm=4000, targets=copy.deepcopy(self.observed))
+        broker.save(state)
+        broker.atomic_json(self.runtime / 'watchdog.json', {'boot_id': self.current_boot, 'updated_at': self.now})
 
-    def save(self, state):
-        self.state = copy.deepcopy(state)
-
-    def check_temperatures(self):
-        if self.hot:
-            raise RuntimeError('Temperature invalid or at/above 80 C')
-
-    def reacquire(self, targets):
-        self.reacquisitions.append(copy.deepcopy(targets))
-        self.observed = copy.deepcopy(targets)
-        self.now += self.repair_duration
+    def fixture_open(self, path, writable=False):
+        self.assertTrue(Path(path).resolve().is_relative_to(self.root))
+        return os.open(path, (os.O_RDWR if writable else os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK)
 
     def automatic(self):
-        self.auto_resets += 1
+        saved, _ = broker.load_preference()
+        self.events.append(('auto', saved['mode']))
 
-    def drift(self):
-        self.observed[0]['target'] = 3000
+    def manual(self, rpm):
+        self.check_temperatures()
+        self.observed = [{'index': 1, 'target': min(5779, max(1200, rpm))},
+                         {'index': 2, 'target': min(6241, max(1200, rpm))}]
+        self.events.append(('manual', rpm))
+        return copy.deepcopy(self.observed)
 
-    def test_repair_preserves_uid_generation_expiry_and_requested_fans(self):
-        before = copy.deepcopy(self.state)
+    def reacquire(self, targets):
+        self.events.append(('repair', copy.deepcopy(targets)))
+        self.observed = copy.deepcopy(targets)
+
+    def check_temperatures(self, limit=80000):
+        if self.temperature >= limit:
+            raise broker.ThermalFault('Temperature at/above limit')
+
+    def profile_bytes(self):
+        return (self.persistence / 'preference.json').read_bytes()
+
+    def test_fresh_boot_empty_runtime_restores_saved_manual_without_ui(self):
+        before = self.profile_bytes()
+        for path in self.runtime.iterdir():
+            path.unlink()
+        self.now = 0
+        self.current_boot = 'boot-B'
+        broker.reset()  # Production watchdog startup establishes Auto first.
         broker.watchdog_tick()
-        self.assertEqual(self.state['mode'], 'manual')
-        for field in ('owner_uid', 'generation', 'expires_at', 'targets', 'boot_id'):
-            self.assertEqual(self.state[field], before[field], field)
-        self.assertEqual(self.reacquisitions, [self.requested])
-        self.assertEqual(self.state['repairs'], [100.0])
-        self.assertEqual(self.auto_resets, 0)
+        state = broker.load_state()
+        self.assertEqual(state['mode'], 'manual')
+        self.assertEqual(state['requested_rpm'], 4000)
+        self.assertEqual(state['owner_uid'], 1000)
+        self.assertEqual(state['boot_id'], 'boot-B')
+        self.assertEqual(self.events[:2], [('auto', 'manual'), ('manual', 4000)])
+        self.assertEqual(self.profile_bytes(), before)
 
-    def test_expired_or_hot_lease_is_released_without_attempting_repair(self):
-        for expiry, hot in ((99, False), (112, True)):
-            with self.subTest(expiry=expiry, hot=hot):
-                self.state.update(mode='manual', expires_at=expiry, repairs=[])
-                self.hot = hot
-                self.reacquisitions.clear()
-                broker.watchdog_tick()
-                self.assertEqual(self.state['mode'], 'auto')
-                self.assertEqual(self.reacquisitions, [])
+    def test_manual_setting_survives_hours_without_any_heartbeat(self):
+        before = self.profile_bytes()
+        self.now += 7200
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'manual')
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.profile_bytes(), before)
 
-    def test_third_drift_in_window_releases_instead_of_fighting_indefinitely(self):
-        for _ in range(2):
+    def test_internal_release_preserves_intent_and_next_tick_restores_it(self):
+        before = self.profile_bytes()
+        broker.command('release')
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.assertEqual(self.profile_bytes(), before)
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'manual')
+        self.assertEqual(self.profile_bytes(), before)
+
+    def test_explicit_auto_is_durable_before_hardware_release(self):
+        broker.command('auto')
+        self.assertEqual(self.events[0], ('auto', 'auto'))
+        saved, error = broker.load_preference()
+        self.assertIsNone(error)
+        self.assertEqual(saved['mode'], 'auto')
+        broker.watchdog_tick()
+        self.assertFalse(any(event[0] == 'manual' for event in self.events))
+
+    def test_failed_auto_storage_does_not_reactivate_old_manual_on_next_tick_or_restart(self):
+        before = self.profile_bytes()
+        with mock.patch.object(broker, 'save_preference', side_effect=OSError('disk full')):
+            with self.assertRaisesRegex(RuntimeError, 'Auto could not be saved'):
+                broker.command('auto')
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.assertEqual(self.profile_bytes(), before)
+        broker.watchdog_tick()
+        self.now += 3600
+        broker.reset()  # Same-boot watchdog restart must retain the safety block.
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.assertFalse(any(event[0] == 'manual' for event in self.events))
+        broker.command('auto')  # A successful explicit choice clears the fault.
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_preference()[0]['mode'], 'auto')
+
+    def test_failed_new_manual_save_cannot_clear_a_previous_failed_auto_restore_block(self):
+        with mock.patch.object(broker, 'save_preference', side_effect=OSError('disk full')):
+            with self.assertRaises(RuntimeError):
+                broker.command('auto')
+            with mock.patch.object(broker, 'owner_uid', return_value=1000):
+                with self.assertRaises(RuntimeError):
+                    broker.command('3500')
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.assertEqual([event for event in self.events if event[0] == 'manual'], [('manual', 3500)])
+        self.assertEqual(broker.load_preference()[0]['rpm'], 4000)
+
+    def test_stop_restart_release_does_not_erase_saved_manual(self):
+        before = self.profile_bytes()
+        broker.reset()  # finally/ExecStopPost release
+        broker.reset()  # daemon startup
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'manual')
+        self.assertEqual(self.profile_bytes(), before)
+
+    def test_corrupt_preference_fails_auto_without_destroying_evidence(self):
+        path = self.persistence / 'preference.json'
+        path.write_text('{bad json')
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.assertIn('invalid', broker.load_state()['error'])
+        self.assertEqual(path.read_text(), '{bad json')
+        self.assertFalse(any(event[0] == 'manual' for event in self.events))
+
+    def test_corrupt_preference_and_hardware_fault_respect_retry_cooldown(self):
+        (self.persistence / 'preference.json').write_text('{bad json')
+        self.hardware.automatic.side_effect = OSError('hardware offline')
+        broker.watchdog_tick()
+        self.assertEqual(self.hardware.automatic.call_count, 1)
+        self.now += 1
+        broker.watchdog_tick()
+        self.assertEqual(self.hardware.automatic.call_count, 1)
+        self.now += broker.RETRY_SECONDS + 1
+        broker.watchdog_tick()
+        self.assertEqual(self.hardware.automatic.call_count, 2)
+
+    def test_preference_symlink_cannot_be_followed_or_overwritten(self):
+        path = self.persistence / 'preference.json'
+        path.unlink()
+        sentinel = self.root / 'sentinel'
+        sentinel.write_text('unchanged')
+        path.symlink_to(sentinel)
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.assertIn('invalid', broker.load_state()['error'])
+        with self.assertRaises(OSError):
+            broker.save_preference(self.preference)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(sentinel.read_text(), 'unchanged')
+
+    def test_hot_pause_retains_intent_until_cooldown_and_hysteresis_satisfied(self):
+        before = self.profile_bytes()
+        self.temperature = 85000
+        broker.watchdog_tick()
+        state = broker.load_state()
+        self.assertEqual(state['mode'], 'auto')
+        self.assertTrue(state['thermal_paused'])
+        self.temperature = 74000
+        self.now += broker.RETRY_SECONDS - 1
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.temperature = 76000
+        self.now += 2
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.temperature = 74000
+        self.now += broker.RETRY_SECONDS + 1
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'manual')
+        self.assertEqual(self.profile_bytes(), before)
+
+    def test_sleep_blocks_restoration_until_resume_preserving_saved_preference(self):
+        before = self.profile_bytes()
+        broker.command('sleep')
+        broker.watchdog_tick()
+        self.assertTrue(broker.load_state()['inhibited'])
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.assertFalse(any(event[0] == 'manual' for event in self.events))
+        broker.command('resume')
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'manual')
+        self.assertEqual(self.profile_bytes(), before)
+
+    def test_failed_resume_recovers_when_hardware_returns_without_ui(self):
+        before = self.profile_bytes()
+        broker.command('sleep')
+        with mock.patch.object(self.hardware, 'automatic', side_effect=OSError('hardware offline')):
+            with self.assertRaises(RuntimeError):
+                broker.command('resume')
+        self.assertFalse(broker.load_state()['inhibited'])
+        self.assertEqual(broker.load_state()['mode'], 'unknown')
+        broker.watchdog_tick()
+        self.assertFalse(any(event[0] == 'manual' for event in self.events))
+        self.now += broker.RETRY_SECONDS + 1
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'manual')
+        self.assertEqual(self.profile_bytes(), before)
+
+    def test_third_drift_pauses_then_retries_saved_intent_after_cooldown(self):
+        before = self.profile_bytes()
+        for _ in range(3):
+            self.observed[0]['target'] = 3000
             broker.watchdog_tick()
             self.now += 1
-            self.drift()
-        self.assertEqual(len(self.reacquisitions), 2)
+        state = broker.load_state()
+        self.assertEqual(state['mode'], 'auto')
+        self.assertEqual(sum(event[0] == 'repair' for event in self.events), 2)
+        self.assertGreater(state['retry_at'], self.now)
         broker.watchdog_tick()
-        self.assertEqual(len(self.reacquisitions), 2)
-        self.assertEqual(self.state['mode'], 'auto')
-        self.assertIn('repeatedly overridden', self.state['error'])
-        self.assertIn('requested', self.state['error'])
-        self.assertIn('observed', self.state['error'])
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.now = state['retry_at'] + 1
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'manual')
+        self.assertEqual(self.profile_bytes(), before)
 
-    def test_sliding_window_retains_recent_repair_budget(self):
-        self.state['expires_at'] = 1000
-        self.state['repairs'] = [70.0, 99.0]
+    def test_repair_keeps_durable_owner_generation_and_target_intent(self):
+        before = self.profile_bytes()
+        self.observed[0]['target'] = 3000
         broker.watchdog_tick()
-        self.assertEqual(self.state['repairs'], [99.0, 100.0])
-        self.now = 101
-        self.drift()
-        broker.watchdog_tick()
-        self.assertEqual(self.state['mode'], 'auto')
-        self.assertEqual(len(self.reacquisitions), 1)
-
-    def test_repair_crossing_lease_deadline_is_not_published_manual(self):
-        self.repair_duration = 13
-        broker.watchdog_tick()
-        self.assertEqual(self.state['mode'], 'auto')
-        self.assertIn('expired', self.state['error'])
-        self.assertEqual(self.auto_resets, 1)
-
-    def test_heat_appearing_during_repair_releases_before_publishing_manual(self):
-        original = self.reacquire
-        def heats_during_repair(targets):
-            original(targets)
-            self.hot = True
-        self.hardware.reacquire.side_effect = heats_during_repair
-        broker.watchdog_tick()
-        self.assertEqual(self.state['mode'], 'auto')
-        self.assertIn('80 C', self.state['error'])
-        self.assertEqual(self.auto_resets, 1)
-
-    def test_failed_reacquisition_releases_instead_of_republishing_manual(self):
-        self.hardware.reacquire.side_effect = RuntimeError('Manual target did not hold')
-        broker.watchdog_tick()
-        self.assertEqual(self.state['mode'], 'auto')
-        self.assertIn('did not hold', self.state['error'])
+        state = broker.load_state()
+        self.assertEqual(state['mode'], 'manual')
+        self.assertEqual(state['owner_uid'], 1000)
+        self.assertEqual(state['generation'], 'a' * 32)
+        self.assertEqual(state['requested_rpm'], 4000)
+        self.assertEqual(self.profile_bytes(), before)
 
 
 if __name__ == '__main__':

@@ -1,5 +1,5 @@
 [Unit]
-Description=Apple Silicon fan lease watchdog
+Description=Apple Silicon persistent fan control supervisor
 After=systemd-tmpfiles-setup.service
 Before=sleep.target shutdown.target
 
@@ -9,7 +9,7 @@ NotifyAccess=main
 WatchdogSec=8s
 TimeoutStartSec=20s
 ExecStart=/usr/local/libexec/apple-silicon-fan-control watchdog
-ExecStopPost=/usr/local/libexec/apple-silicon-fan-control auto
+ExecStopPost=/usr/local/libexec/apple-silicon-fan-control release
 Restart=always
 RestartSec=1
 TimeoutStopSec=15
@@ -17,7 +17,9 @@ UMask=0022
 NoNewPrivileges=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/run/apple-silicon-fan-control /sys
+ReadWritePaths=/run/apple-silicon-fan-control /var/lib/apple-silicon-fan-control /sys
+StateDirectory=apple-silicon-fan-control
+StateDirectoryMode=0755
 RuntimeDirectory=apple-silicon-fan-control
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes

@@ -12,7 +12,7 @@ function fixture(changes = {}) {
     is_apple_silicon: true, has_fan: true, fan_count: 2,
     device_model: 'Apple MacBook Pro', fan_rpm: 2500, fan_target: 2500,
     fan_min: 1200, fan_max: 6241, mode: 'unknown',
-    fan_control_enabled: true, control_available: true,
+    fan_control_enabled: true, control_available: true, persistent: true,
     fans: [{index: 1, label: 'Fan 1', rpm: 2300, min: 1200, max: 5779, target: 2317},
            {index: 2, label: 'Fan 2', rpm: 2500, min: 1200, max: 6241, target: 2502}],
     sensors: {nand: 0, battery: 34.5, regulator: null, wifi: 49},
@@ -48,6 +48,20 @@ test('all reported fan limits must be safe for manual controls', () => {
 test('unavailable permission never enables controls', () => {
   assert.equal(parse({control_available: false}).controlEnabled, false);
   assert.equal(parse({control_available: 'true'}).controlEnabled, false);
+});
+test('legacy or malformed persistence capability cannot enable lasting controls', () => {
+  for (const persistent of [false, null, undefined, 'true', 1])
+    assert.equal(parse({persistent}).controlEnabled, false);
+  assert.equal(parse({persistent: true}).controlEnabled, true);
+});
+test('saved manual preferences require integer RPM and integer owner', () => {
+  const valid = {saved_mode: 'manual', saved_rpm: 4000, saved_owner_uid: 1000};
+  const result = parse(valid);
+  assert.equal(result.savedMode, 'manual');
+  assert.equal(result.savedRpm, 4000);
+  assert.equal(result.savedOwnerUid, 1000);
+  assert.equal(parse({...valid, saved_rpm: 4000.5}).savedRpm, null);
+  assert.equal(parse({...valid, saved_owner_uid: 1000.5}).savedOwnerUid, null);
 });
 test('fanless/error states cannot enable numeric controls', () => {
   assert.equal(parse({has_fan: false}).controlEnabled, false);

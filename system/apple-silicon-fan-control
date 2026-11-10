@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Root-owned, bounded fan control with an independently supervised lease.
+"""Root-owned persistent fan settings with independently supervised recovery.
 
 Only status is available without root. Production paths are fixed: environment
 variables and command-line arguments cannot redirect privileged filesystem I/O.
@@ -20,7 +20,9 @@ import uuid
 
 RUNTIME = Path('/run/apple-silicon-fan-control')
 SYSFS = Path('/sys')
-LEASE_SECONDS = 12.0
+PERSISTENCE = Path('/var/lib/apple-silicon-fan-control')
+RETRY_SECONDS = 30.0
+DRIFT_COOLDOWN_SECONDS = 60.0
 WATCHDOG_INTERVAL = 2.0
 WATCHDOG_MAX_AGE = 6.0
 MAX_JSON = 65536
@@ -53,7 +55,36 @@ def read_json(path):
         data = stream.read(MAX_JSON + 1)
     if len(data) > MAX_JSON:
         raise RuntimeError('Oversized broker state')
-    value = json.loads(data)
+    depth = 0
+    quoted = False
+    escaped = False
+    for character in data:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == '\\':
+                escaped = True
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+        elif character in '{[':
+            depth += 1
+            if depth > 16:
+                raise RuntimeError('Invalid broker JSON: excessive nesting')
+        elif character in '}]':
+            depth -= 1
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('Duplicate JSON field: ' + str(key))
+            value[key] = item
+        return value
+    try:
+        value = json.loads(data, object_pairs_hook=unique_object)
+    except (ValueError, RecursionError) as exc:
+        raise RuntimeError('Invalid broker JSON: ' + str(exc)) from exc
     if not isinstance(value, dict):
         raise RuntimeError('Invalid broker state')
     return value
@@ -69,6 +100,11 @@ def atomic_json(path, data):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         with contextlib.suppress(FileNotFoundError):
             temp.unlink()
@@ -95,6 +131,10 @@ def locked():
         yield
     finally:
         os.close(fd)
+
+
+class ThermalFault(RuntimeError):
+    """A missing, invalid or excessive temperature requires a cooling pause."""
 
 
 class Hardware:
@@ -199,14 +239,14 @@ class Hardware:
         self.reacquire(targets)
         return targets
 
-    def check_temperatures(self):
+    def check_temperatures(self, limit=80000):
         sensors = list(self.directory.glob('temp*_input'))
         if not sensors:
-            raise RuntimeError('Temperature monitoring unavailable')
+            raise ThermalFault('Temperature monitoring unavailable')
         for path in sensors:
             raw = path.read_text().strip()
-            if not re.fullmatch(r'-?[0-9]{1,7}', raw) or not -40000 <= int(raw) < 80000:
-                raise RuntimeError('Temperature invalid or at/above 80 C; releasing to firmware')
+            if not re.fullmatch(r'-?[0-9]{1,7}', raw) or not -40000 <= int(raw) < limit:
+                raise ThermalFault('Temperature invalid or at/above %g C; manual setting paused' % (limit / 1000))
 
     def observed_targets(self):
         return [{'index': index, 'target': int(path.read_text().strip())}
@@ -247,10 +287,64 @@ class Hardware:
             raise RuntimeError('Manual target did not hold: ' + self.target_diagnostic(targets, observed))
 
 
+def preference_default():
+    return {'schema_version': 1, 'mode': 'auto', 'rpm': None,
+            'owner_uid': None, 'generation': '0' * 32}
+
+
+def validate_preference(value):
+    expected = {'schema_version', 'mode', 'rpm', 'owner_uid', 'generation'}
+    if (not isinstance(value, dict) or set(value) != expected
+            or type(value['schema_version']) is not int or value['schema_version'] != 1
+            or value['mode'] not in ('auto', 'manual')
+            or not isinstance(value['generation'], str)
+            or not re.fullmatch(r'[0-9a-f]{32}', value['generation'])):
+        raise RuntimeError('Invalid saved fan preference schema')
+    if value['mode'] == 'auto':
+        if value['rpm'] is not None or value['owner_uid'] is not None:
+            raise RuntimeError('Automatic preference must not contain a manual target')
+    elif (type(value['rpm']) is not int or not 1000 <= value['rpm'] <= 7999
+          or type(value['owner_uid']) is not int or not 0 <= value['owner_uid'] <= 4294967295):
+        raise RuntimeError('Invalid saved manual RPM or owner')
+    return value
+
+
+def secure_persistence(create=False):
+    if create:
+        PERSISTENCE.mkdir(mode=0o755, exist_ok=True)
+    info = PERSISTENCE.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError('Insecure saved-preference directory')
+
+
+def load_preference():
+    try:
+        secure_persistence()
+        return validate_preference(read_json(PERSISTENCE / 'preference.json')), None
+    except FileNotFoundError:
+        return preference_default(), None
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        return preference_default(), 'Saved fan preference is invalid: ' + str(exc)
+
+
+def save_preference(preference):
+    validate_preference(preference)
+    secure_persistence(create=True)
+    path = PERSISTENCE / 'preference.json'
+    # Explicit user changes may replace malformed JSON, but never bypass an
+    # insecure directory, symlink or writable/non-root-owned file.
+    if path.exists() or path.is_symlink():
+        fd = secure_regular(path)
+        os.close(fd)
+    atomic_json(path, preference)
+
+
 def state_default(error=None):
     return {'schema_version': 1, 'mode': 'unknown', 'owner_uid': None,
             'expires_at': 0, 'boot_id': boot_id(), 'generation': uuid.uuid4().hex,
-            'targets': [], 'inhibited': False, 'error': error, 'repairs': [], 'recovering': False}
+            'targets': [], 'inhibited': False, 'error': error, 'repairs': [],
+            'recovering': False, 'requested_rpm': None, 'retry_at': 0,
+            'thermal_paused': False, 'restore_blocked_generation': None, 'restore_blocked_reason': None}
 
 
 def load_state():
@@ -264,11 +358,21 @@ def load_state():
         targets = state.get('targets')
         repairs = state.setdefault('repairs', [])
         recovering = state.setdefault('recovering', False)
+        requested = state.setdefault('requested_rpm', None)
+        retry_at = state.setdefault('retry_at', 0)
+        thermal_paused = state.setdefault('thermal_paused', False)
+        blocked_generation = state.setdefault('restore_blocked_generation', None)
+        blocked_reason = state.setdefault('restore_blocked_reason', None)
         if (state.get('schema_version') != 1 or mode not in ('auto', 'manual', 'unknown')
                 or type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry < 0
                 or (owner is not None and (type(owner) is not int or owner < 0))
                 or not re.fullmatch(r'[0-9a-f]{32}', str(state.get('generation', '')))
                 or type(state.get('inhibited')) is not bool or type(recovering) is not bool
+                or type(thermal_paused) is not bool
+                or (blocked_generation is not None and (not isinstance(blocked_generation, str) or not re.fullmatch(r'[0-9a-f]{32}', blocked_generation)))
+                or (blocked_reason is not None and not isinstance(blocked_reason, str))
+                or type(retry_at) not in (int, float) or not math.isfinite(retry_at) or retry_at < 0
+                or (requested is not None and (type(requested) is not int or not 1000 <= requested <= 7999))
                 or not isinstance(targets, list) or len(targets) > 64
                 or not isinstance(repairs, list) or len(repairs) > MAX_DRIFT_REPAIRS
                 or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in repairs)
@@ -281,10 +385,10 @@ def load_state():
                     or type(target.get('target')) is not int or not 100 <= target['target'] <= 50000):
                 raise RuntimeError('Invalid broker target state')
             indices.add(target['index'])
-        if mode == 'manual' and (owner is None or not targets or expiry <= 0):
-            raise RuntimeError('Incomplete manual lease state')
+        if mode == 'manual' and (owner is None or not targets):
+            raise RuntimeError('Incomplete manual controller state')
         return state
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
         return state_default('No valid broker state')
 
 
@@ -298,37 +402,46 @@ def watchdog_ready():
 
 
 def status():
+    preference, preference_error = load_preference()
+    saved = {'persistent': True, 'saved_mode': preference['mode'],
+             'saved_rpm': preference['rpm'], 'saved_owner_uid': preference['owner_uid'],
+             'preference_error': preference_error, 'requested_rpm': preference['rpm']}
     try:
         secure_runtime()
         state = load_state()
         ready = watchdog_ready()
-        remaining = max(0, float(state.get('expires_at', 0)) - clock())
-        mode = state.get('mode', 'unknown')
-        if mode not in ('auto', 'manual', 'unknown'):
-            mode = 'unknown'
-        if not ready or (mode == 'manual' and remaining <= 0):
-            mode = 'unknown'
-        return {**state, 'mode': mode, 'ready': ready and mode != 'unknown' and not state['inhibited'],
-                'expires_in': round(remaining, 1) if mode == 'manual' else 0,
-                'error': state.get('error') if ready else 'Fan watchdog is not running'}
+        mode = state['mode'] if ready else 'unknown'
+        error = (preference_error or state.get('error')) if ready else 'Fan watchdog is not running'
+        notice = None
+        if mode == 'manual' and error and error.startswith('Recovered manual target drift:'):
+            notice, error = error, None
+        pause_reason = ('Paused for sleep' if state['inhibited'] else state.get('error')) if preference['mode'] == 'manual' and mode != 'manual' else None
+        return {**state, **saved, 'mode': mode, 'paused_reason': pause_reason,
+                'ready': ready and mode != 'unknown' and not state['inhibited'],
+                'expires_in': 0, 'retry_in': round(max(0, state['retry_at'] - clock()), 1),
+                'error': error, 'notice': notice}
     except (OSError, ValueError, TypeError, RuntimeError):
-        return {**state_default('Fan control is not configured'), 'ready': False, 'expires_in': 0}
+        return {**state_default('Fan control is not configured'), **saved,
+                'ready': False, 'expires_in': 0, 'retry_in': 0, 'notice': None}
 
 
 def save(state):
     atomic_json(RUNTIME / 'state.json', state)
 
 
-def reset(reason=None):
-    inhibited = load_state().get('inhibited', False)
+def reset(reason=None, retry_delay=0, thermal_paused=False, clear_block=False):
+    previous = load_state()
+    inhibited = previous.get('inhibited', False)
     state = state_default()
-    state['inhibited'] = inhibited
-    # Prime+zero is also a multi-step change. Persist unknown first so a killed
-    # Auto request is retried instead of leaving an old 'auto' claim behind.
+    state.update(inhibited=inhibited, retry_at=clock() + retry_delay if retry_delay else 0,
+                 thermal_paused=thermal_paused)
+    if not clear_block:
+        state['restore_blocked_generation'] = previous.get('restore_blocked_generation')
+        state['restore_blocked_reason'] = previous.get('restore_blocked_reason')
+    # All physical transitions are journaled independently from durable intent.
     try:
         save(state)
     except OSError as exc:
-        # Storage trouble must never prevent a best-effort hardware release.
         print('Cannot journal automatic recovery: ' + str(exc), file=sys.stderr)
     try:
         Hardware().automatic()
@@ -336,6 +449,7 @@ def reset(reason=None):
         state['error'] = reason
     except (OSError, ValueError, RuntimeError) as exc:
         state['error'] = 'Could not restore automatic cooling: ' + str(exc)
+        state['retry_at'] = clock() + RETRY_SECONDS
     save(state)
     return state['mode'] == 'auto'
 
@@ -347,94 +461,180 @@ def owner_uid():
     return int(value)
 
 
+def apply_manual(preference, persist=False):
+    previous = load_state()
+    state = state_default('Applying saved manual target')
+    if persist:
+        state['restore_blocked_generation'] = previous.get('restore_blocked_generation')
+        state['restore_blocked_reason'] = previous.get('restore_blocked_reason')
+    state.update(owner_uid=preference['owner_uid'], generation=preference['generation'],
+                 requested_rpm=preference['rpm'], recovering=True)
+    save(state)
+    committed = False
+    try:
+        hardware = Hardware()
+        targets = hardware.manual(preference['rpm'])
+        hardware.check_temperatures()
+        if persist:
+            save_preference(preference)
+            committed = True
+        state.update(mode='manual', targets=targets, recovering=False, error=None,
+                     restore_blocked_generation=None, restore_blocked_reason=None)
+        save(state)
+    except (OSError, ValueError, RuntimeError) as exc:
+        reset('Manual target paused: ' + str(exc), retry_delay=RETRY_SECONDS,
+              thermal_paused=isinstance(exc, ThermalFault))
+        saved_now, saved_error = load_preference()
+        if committed or (saved_error is None and saved_now['generation'] == preference['generation']):
+            intent_note = 'the new target is saved but its application or durability needs recovery'
+        else:
+            intent_note = 'the prior saved intent is retained'
+        raise RuntimeError('Manual control failed; automatic recovery attempted; ' + intent_note + ': ' + str(exc)) from exc
+
+
 def command(action, generation=None):
     with locked():
         if action in ('sleep', 'resume'):
             state = load_state()
-            state['inhibited'] = True
+            # Resume is the explicit awake signal. A failed physical reset keeps
+            # mode unknown and schedules retries, but must not leave an eternal
+            # sleep inhibit after the system has actually resumed.
+            state['inhibited'] = action == 'sleep'
             save(state)
-            restored = reset()
-            if action == 'resume' and restored:
-                state = load_state()
-                state['inhibited'] = False
-                save(state)
+            if not reset('Manual setting paused for sleep' if action == 'sleep' else None):
+                raise RuntimeError(load_state()['error'])
+            return
+        if action in ('auto', 'release'):
+            preference_failure = None
+            if action == 'auto':
+                # Commit explicit Auto intent first: a crash after release must
+                # never resurrect the previously selected manual preference.
+                try:
+                    preference = preference_default()
+                    preference['generation'] = uuid.uuid4().hex
+                    save_preference(preference)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    preference_failure = exc
+            reason = None
+            if preference_failure is not None:
+                previous_preference, previous_error = load_preference()
+                current = load_state()
+                reason = 'Auto was requested but could not be saved: ' + str(preference_failure)
+                current.update(error=reason, restore_blocked_reason=reason,
+                               restore_blocked_generation=previous_preference['generation'] if previous_error is None and previous_preference['mode'] == 'manual' else None)
+                # Journal the restore block before physical release as well. A
+                # killed Auto command must not reopen the old manual preference.
+                try:
+                    save(current)
+                except OSError as exc:
+                    print('Cannot journal restore block: ' + str(exc), file=sys.stderr)
+            restored = reset(reason, clear_block=action == 'auto' and preference_failure is None)
+            if preference_failure is not None:
+                raise RuntimeError('Automatic cooling release attempted, but Auto could not be saved: ' + str(preference_failure))
             if not restored:
                 raise RuntimeError(load_state()['error'])
             return
-        if action == 'auto':
-            if not reset():
-                raise RuntimeError(load_state()['error'])
-            return
-        # Authorization to request manual control is distinct from the service's
-        # continued liveness. A stopped or stalled watchdog cannot issue leases.
         if not watchdog_ready():
             raise RuntimeError('Fan watchdog is not running; manual control refused')
         uid = owner_uid()
         state = load_state()
-        if state.get('inhibited'):
+        if state['inhibited']:
             raise RuntimeError('Fan control is inhibited for sleep or failed resume recovery')
-        if state.get('mode') not in ('auto', 'manual'):
+        if state['mode'] not in ('auto', 'manual'):
             raise RuntimeError('Automatic cooling has not been established; manual control refused')
         if action == 'heartbeat':
-            if (state.get('mode') != 'manual' or state.get('owner_uid') != uid
-                    or generation != state.get('generation')
-                    or float(state.get('expires_at', 0)) <= clock()):
-                raise RuntimeError('No active manual lease belongs to this user')
-            state['expires_at'] = clock() + LEASE_SECONDS
-            save(state)
+            # Compatibility with older widgets. The root daemon now owns the
+            # saved manual setting; UI liveness no longer controls its lifetime.
+            if state['mode'] != 'manual' or state['owner_uid'] != uid or generation != state['generation']:
+                raise RuntimeError('No active manual setting belongs to this user/generation')
             return
-        if state.get('mode') == 'manual' and state.get('owner_uid') != uid:
-            raise RuntimeError('Another user owns the manual fan lease; select Auto first')
-        # Journal a recovery-needed state before touching hardware. If the
-        # final state write fails or this process dies midway, the independent
-        # watchdog sees unknown and retries Auto instead of trusting old state.
-        save(state_default('Manual fan change in progress'))
-        try:
-            targets = Hardware().manual(int(action))
-            state = state_default()
-            state.update(mode='manual', owner_uid=uid, targets=targets,
-                         expires_at=clock() + LEASE_SECONDS)
+        if state['mode'] == 'manual' and state['owner_uid'] != uid:
+            raise RuntimeError('Another user owns the manual setting; select Auto first')
+        preference = {'schema_version': 1, 'mode': 'manual', 'rpm': int(action),
+                      'owner_uid': uid, 'generation': uuid.uuid4().hex}
+        apply_manual(preference, persist=True)
+
+
+def reconcile():
+    preference, preference_error = load_preference()
+    state = load_state()
+    if preference_error:
+        if state['mode'] == 'unknown' and clock() < state['retry_at']:
+            return
+        if state['mode'] != 'auto' or state.get('error') != preference_error:
+            reset(preference_error, retry_delay=RETRY_SECONDS)
+        return
+    if state['inhibited']:
+        if state['mode'] != 'auto' and clock() >= state['retry_at']:
+            reset('Manual setting paused for sleep', retry_delay=RETRY_SECONDS)
+        return
+    if state['mode'] == 'unknown':
+        if clock() < state['retry_at']:
+            return
+        if not reset('Recovered interrupted control operation'):
+            return
+        state = load_state()
+    if preference['mode'] == 'auto':
+        if state['mode'] != 'auto':
+            reset()
+        return
+    if state.get('restore_blocked_generation') == preference['generation']:
+        if state['mode'] != 'auto':
+            reset(state.get('restore_blocked_reason'), retry_delay=RETRY_SECONDS)
+        elif state.get('error') != state.get('restore_blocked_reason'):
+            state['error'] = state.get('restore_blocked_reason')
             save(state)
+        return
+    if state['mode'] == 'auto':
+        if clock() < state['retry_at']:
+            return
+        try:
+            hardware = Hardware()
+            # Hysteresis: once released, wait until every exposed peripheral is
+            # below 75 C before restoring a saved manual setting.
+            hardware.check_temperatures(limit=75000)
+            apply_manual(preference)
         except (OSError, ValueError, RuntimeError) as exc:
-            reset('Manual control failed: ' + str(exc))
-            raise RuntimeError('Manual control failed; attempted automatic recovery: ' + str(exc)) from exc
+            current = load_state()
+            if current['mode'] == 'auto':
+                current.update(error='Saved manual target paused: ' + str(exc),
+                               retry_at=clock() + RETRY_SECONDS,
+                               thermal_paused=isinstance(exc, ThermalFault))
+                save(current)
+        return
+    if state['generation'] != preference['generation'] or state['requested_rpm'] != preference['rpm']:
+        if reset('Reconciling saved fan preference'):
+            try:
+                apply_manual(preference)
+            except RuntimeError:
+                pass
+        return
+    try:
+        hardware = Hardware()
+        hardware.check_temperatures()
+        observed = hardware.observed_targets()
+        if not hardware.matches(state['targets'], observed):
+            diagnostic = hardware.target_diagnostic(state['targets'], observed)
+            repairs = [value for value in state['repairs'] if clock() - value < DRIFT_REPAIR_WINDOW]
+            if len(repairs) >= MAX_DRIFT_REPAIRS:
+                raise RuntimeError('Manual targets repeatedly overridden after %d repairs in %d seconds: %s'
+                                   % (MAX_DRIFT_REPAIRS, DRIFT_REPAIR_WINDOW, diagnostic))
+            save({**state, 'mode': 'unknown', 'recovering': True,
+                  'error': 'Recovering manual target drift: ' + diagnostic})
+            hardware.reacquire(state['targets'])
+            hardware.check_temperatures()
+            state.update(recovering=False, repairs=repairs + [clock()],
+                         error='Recovered manual target drift: ' + diagnostic)
+            save(state)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        reset('Saved manual target paused: ' + str(exc),
+              retry_delay=DRIFT_COOLDOWN_SECONDS if 'overridden' in str(exc) else RETRY_SECONDS,
+              thermal_paused=isinstance(exc, ThermalFault))
 
 
 def watchdog_tick():
     with locked():
-        state = load_state()
-        if state.get('mode') == 'manual':
-            try:
-                if state.get('inhibited'):
-                    raise RuntimeError('Sleep inhibited manual control')
-                if float(state.get('expires_at', 0)) <= clock():
-                    raise RuntimeError('Manual lease expired')
-                hardware = Hardware()
-                hardware.check_temperatures()
-                observed = hardware.observed_targets()
-                if not hardware.matches(state['targets'], observed):
-                    diagnostic = hardware.target_diagnostic(state['targets'], observed)
-                    repairs = [value for value in state['repairs']
-                               if clock() - value < DRIFT_REPAIR_WINDOW]
-                    if len(repairs) >= MAX_DRIFT_REPAIRS:
-                        raise RuntimeError('Manual targets repeatedly overridden after %d repairs in %d seconds: %s'
-                                           % (MAX_DRIFT_REPAIRS, DRIFT_REPAIR_WINDOW, diagnostic))
-                    # Preserve generation, owner and expiry across recovery. A
-                    # repair must never renew an abandoned UI's manual lease.
-                    pending = {**state, 'mode': 'unknown', 'recovering': True, 'error': 'Recovering manual target drift: ' + diagnostic}
-                    save(pending)
-                    hardware.reacquire(state['targets'])
-                    hardware.check_temperatures()
-                    if clock() >= state['expires_at']:
-                        raise RuntimeError('Manual lease expired during target recovery')
-                    state['recovering'] = False
-                    state['repairs'] = repairs + [clock()]
-                    state['error'] = 'Recovered manual target drift: ' + diagnostic
-                    save(state)
-            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-                reset(str(exc))
-        elif state.get('mode') != 'auto':
-            reset()
+        reconcile()
         atomic_json(RUNTIME / 'watchdog.json', {'boot_id': boot_id(), 'updated_at': clock()})
 
 
@@ -488,7 +688,7 @@ def main():
         if len(sys.argv) != 3 or not re.fullmatch(r'[0-9a-f]{32}', sys.argv[2]):
             raise RuntimeError('Heartbeat requires the current 32-character lease generation')
         generation = sys.argv[2]
-    elif len(sys.argv) != 2 or not re.fullmatch(r'auto|status|watchdog|sleep|resume|[1-7][0-9]{3}', action):
+    elif len(sys.argv) != 2 or not re.fullmatch(r'auto|release|status|watchdog|sleep|resume|[1-7][0-9]{3}', action):
         raise RuntimeError('Invalid fan broker action')
     if action == 'status':
         print(json.dumps(status(), allow_nan=False, separators=(',', ':')))

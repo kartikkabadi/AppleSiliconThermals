@@ -16,7 +16,7 @@ Scope {
     Timer {
         interval: 7400; running: true
         onTriggered: {
-            if (!widget.dataValid || widget.readBusy || widget.writeBusy || widget.leaseArmed) console.error("ASSERT FAILED: startup failure did not recover")
+            if (!widget.dataValid || widget.readBusy || widget.writeBusy) console.error("ASSERT FAILED: startup failure did not recover")
             else console.log("WIDGET TEST PASSED")
             Qt.quit()
         }

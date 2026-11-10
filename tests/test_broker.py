@@ -28,6 +28,8 @@ class Fixture(unittest.TestCase):
         self.hw.mkdir(parents=True)
         self.runtime = self.root / 'run'
         self.runtime.mkdir()
+        self.persistence = self.root / 'persistent'
+        self.persistence.mkdir()
         (self.root / 'sys/class/hwmon').mkdir(parents=True)
         (self.root / 'sys/class/hwmon/hwmon3').symlink_to(self.hw)
         self.param = self.root / 'sys/module/macsmc_hwmon/parameters/fan_control'
@@ -42,6 +44,8 @@ class Fixture(unittest.TestCase):
         self.writes = []
         self._patch('SYSFS', self.root / 'sys')
         self._patch('RUNTIME', self.runtime)
+        self._patch('PERSISTENCE', self.persistence)
+        self._patch('secure_persistence', lambda create=False: None)
         self._patch('clock', lambda: self.now)
         self._patch('time', types.SimpleNamespace(sleep=lambda seconds: None))
         self._patch('boot_id', lambda: 'fixture-boot')
@@ -81,7 +85,7 @@ class Fixture(unittest.TestCase):
             broker.command('7999')
         self.assertEqual(self.writes, [('fan1_target', 0), ('fan1_target', 5779), ('fan2_target', 0), ('fan2_target', 6241)])
         state = broker.status()
-        self.assertEqual((state['mode'], state['owner_uid'], state['expires_in']), ('manual', 1000, 12))
+        self.assertEqual((state['mode'], state['owner_uid'], state['expires_in']), ('manual', 1000, 0))
 
     def test_manual_clamps_below_minimum(self):
         broker.command('1000')
@@ -112,7 +116,7 @@ class Fixture(unittest.TestCase):
                 raise OSError('fixture I/O failure')
             original(hardware, path, value)
         with mock.patch.object(broker.Hardware, 'write', failing):
-            with self.assertRaisesRegex(RuntimeError, 'attempted automatic recovery'):
+            with self.assertRaisesRegex(RuntimeError, 'automatic recovery attempted'):
                 broker.command('4000')
         self.assertEqual(self.writes[-1], ('fan2_target', 0))
         self.assertIn(('fan1_target', 0), self.writes)
@@ -231,7 +235,7 @@ class Fixture(unittest.TestCase):
         self.assertFalse(broker.status()['ready'])
         self.assertEqual(self.writes, [])
 
-    def test_heartbeat_requires_owner_and_unexpired_lease(self):
+    def test_legacy_heartbeat_validates_owner_without_changing_lifetime(self):
         with mock.patch.dict(os.environ, {'SUDO_UID': '1000'}):
             broker.command('4000')
         with mock.patch.dict(os.environ, {'SUDO_UID': '1001'}):
@@ -239,17 +243,14 @@ class Fixture(unittest.TestCase):
                 broker.command('heartbeat', broker.load_state()['generation'])
             with self.assertRaisesRegex(RuntimeError, 'Another user'):
                 broker.command('4500')
-        self.now += 3
+        original = broker.load_state()
+        self.now += 86400
         self.health()
         with mock.patch.dict(os.environ, {'SUDO_UID': '1000'}):
-            broker.command('heartbeat', broker.load_state()['generation'])
-        self.assertEqual(broker.load_state()['expires_at'], 115)
-        self.now = 116
-        self.health()
-        self.assertEqual(broker.status()['mode'], 'unknown')
-        with mock.patch.dict(os.environ, {'SUDO_UID': '1000'}):
-            with self.assertRaisesRegex(RuntimeError, 'No active manual lease'):
-                broker.command('heartbeat', broker.load_state()['generation'])
+            broker.command('heartbeat', original['generation'])
+        self.assertEqual(broker.load_state(), original)
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual(broker.status()['saved_rpm'], 4000)
 
     def test_boot_mismatch_cannot_extend_lease(self):
         broker.command('4000')
@@ -289,14 +290,16 @@ class Fixture(unittest.TestCase):
         (self.runtime / 'state.json').write_text('bad JSON')
         self.assertEqual(broker.status()['mode'], 'unknown')
 
-    def test_watchdog_expires_manual_lease_and_releases_all_fans(self):
+    def test_watchdog_keeps_manual_without_ui_or_heartbeat(self):
         broker.command('4000')
-        self.now += 13
+        original_writes = list(self.writes)
+        self.now += 86400
         broker.watchdog_tick()
         state = broker.status()
-        self.assertEqual(state['mode'], 'auto')
-        self.assertIn('expired', state['error'])
-        self.assertEqual(self.writes[-1], ('fan2_target', 0))
+        self.assertEqual(state['mode'], 'manual')
+        self.assertEqual(state['saved_rpm'], 4000)
+        self.assertEqual(state['expires_in'], 0)
+        self.assertEqual(self.writes, original_writes)
 
     def test_watchdog_releases_hot_or_overridden_fans(self):
         broker.command('4000')
@@ -307,7 +310,8 @@ class Fixture(unittest.TestCase):
         broker.command('4000')
         (self.hw / 'fan1_target').write_text('5779')
         broker.watchdog_tick()
-        self.assertIn('Recovered manual target drift', broker.status()['error'])
+        self.assertIn('Recovered manual target drift', broker.status()['notice'])
+        self.assertIsNone(broker.status()['error'])
         self.assertEqual(broker.status()['mode'], 'manual')
 
     def test_unknown_recovery_state_refuses_numeric_request(self):
@@ -331,13 +335,18 @@ class Fixture(unittest.TestCase):
         self.assertTrue(broker.status()['ready'])
         self.assertEqual(broker.status()['mode'], 'auto')
 
-    def test_failed_resume_keeps_manual_inhibited(self):
+    def test_failed_resume_retries_saved_manual_when_hardware_recovers(self):
+        broker.command('4000')
         broker.command('sleep')
         with mock.patch.object(broker.Hardware, 'automatic', side_effect=OSError('I/O failure')):
             with self.assertRaises(RuntimeError):
                 broker.command('resume')
-        self.assertTrue(broker.load_state()['inhibited'])
+        self.assertFalse(broker.load_state()['inhibited'])
         self.assertFalse(broker.status()['ready'])
+        self.now += 31
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual(broker.status()['saved_rpm'], 4000)
 
     def test_stale_generation_cannot_renew_new_manual_request(self):
         broker.command('4000')
@@ -345,9 +354,9 @@ class Fixture(unittest.TestCase):
         broker.command('4500')
         self.now += 3
         self.health()
-        with self.assertRaisesRegex(RuntimeError, 'No active manual lease'):
+        with self.assertRaisesRegex(RuntimeError, 'No active manual setting'):
             broker.command('heartbeat', old_generation)
-        self.assertEqual(broker.load_state()['expires_at'], 112)
+        self.assertEqual(broker.load_state()['expires_at'], 0)
 
     def test_corrupt_state_fields_become_unknown(self):
         broker.command('4000')
@@ -364,6 +373,135 @@ class Fixture(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 broker.command('auto')
         self.assertEqual(self.writes, [('fan1_target', 5779), ('fan1_target', 0), ('fan2_target', 6241), ('fan2_target', 0)])
+
+    def test_saved_manual_restores_after_release_and_new_boot_without_ui(self):
+        with mock.patch.dict(os.environ, {'SUDO_UID': '1000'}):
+            broker.command('4000')
+        preference, error = broker.load_preference()
+        self.assertIsNone(error)
+        broker.command('release')
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertEqual(broker.status()['saved_mode'], 'manual')
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual(broker.status()['generation'], preference['generation'])
+        with mock.patch.object(broker, 'boot_id', return_value='next-boot'):
+            broker.reset()
+            broker.watchdog_tick()
+            state = broker.status()
+            self.assertEqual((state['mode'], state['saved_rpm'], state['owner_uid']), ('manual', 4000, 1000))
+        self.assertEqual(broker.load_preference()[0], preference)
+
+    def test_user_auto_clears_saved_manual_before_physical_transition(self):
+        broker.command('4000')
+        original = broker.Hardware.automatic
+        def checked(hardware):
+            self.assertEqual(broker.load_preference()[0]['mode'], 'auto')
+            original(hardware)
+        with mock.patch.object(broker.Hardware, 'automatic', checked):
+            broker.command('auto')
+        self.now += 86400
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['saved_mode'], 'auto')
+        self.assertEqual(broker.status()['mode'], 'auto')
+
+    def test_hot_pause_retains_intent_and_resumes_only_below_hysteresis(self):
+        broker.command('4000')
+        saved = (self.persistence / 'preference.json').read_bytes()
+        (self.hw / 'temp1_input').write_text('85000')
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertEqual(broker.status()['saved_mode'], 'manual')
+        self.assertTrue(broker.status()['thermal_paused'])
+        (self.hw / 'temp1_input').write_text('76000')
+        self.now += 31
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        (self.hw / 'temp1_input').write_text('74000')
+        self.now += 31
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), saved)
+
+    def test_corrupt_preference_is_not_automatically_overwritten(self):
+        broker.command('4000')
+        evidence = b'{"mode":"manual", broken'
+        (self.persistence / 'preference.json').write_bytes(evidence)
+        broker.watchdog_tick()
+        writes = list(self.writes)
+        broker.watchdog_tick()
+        self.assertEqual(self.writes, writes)
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertIn('invalid', broker.status()['preference_error'])
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+        broker.command('auto')
+        self.assertIsNone(broker.status()['preference_error'])
+
+    def test_failed_numeric_save_retains_last_acknowledged_preference(self):
+        broker.command('4000')
+        previous = broker.load_preference()[0]
+        with mock.patch.object(broker, 'save_preference', side_effect=OSError('disk full')):
+            with self.assertRaisesRegex(RuntimeError, 'prior saved intent'):
+                broker.command('4500')
+        self.assertEqual(broker.load_preference()[0], previous)
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.now += 31
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual(broker.status()['requested_rpm'], 4000)
+
+    def test_preference_atomic_write_syncs_file_and_parent_directory(self):
+        original = broker.os.fsync
+        synced = []
+        def record(fd):
+            synced.append(__import__('stat').S_ISDIR(os.fstat(fd).st_mode))
+            original(fd)
+        with mock.patch.object(broker.os, 'fsync', side_effect=record):
+            broker.save_preference(broker.preference_default())
+        self.assertIn(False, synced)
+        self.assertIn(True, synced)
+        self.assertEqual((self.persistence / 'preference.json').stat().st_mode & 0o777, 0o644)
+
+    def test_failed_auto_save_blocks_old_manual_until_successful_user_change(self):
+        broker.command('4000')
+        old = broker.load_preference()[0]
+        with mock.patch.object(broker, 'save_preference', side_effect=OSError('disk full')):
+            with self.assertRaisesRegex(RuntimeError, 'Auto could not be saved'):
+                broker.command('auto')
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertEqual(broker.status()['restore_blocked_generation'], old['generation'])
+        broker.reset()
+        self.now += 3600
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        broker.command('4500')
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertIsNone(broker.status()['restore_blocked_generation'])
+
+    def test_failed_auto_persistence_journals_restore_block_before_release(self):
+        broker.command('4000')
+        generation = broker.load_preference()[0]['generation']
+        def interrupted(_hardware):
+            self.assertEqual(broker.load_state()['restore_blocked_generation'], generation)
+            raise SystemExit('interrupted physical Auto')
+        with mock.patch.object(broker, 'save_preference', side_effect=OSError('disk full')), mock.patch.object(broker.Hardware, 'automatic', interrupted):
+            with self.assertRaises(SystemExit):
+                broker.command('auto')
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertEqual(broker.status()['saved_mode'], 'manual')
+
+    def test_invalid_saved_profiles_are_rejected_strictly(self):
+        manual = {'schema_version': 1, 'mode': 'manual', 'rpm': 4000,
+                  'owner_uid': 1000, 'generation': 'a' * 32}
+        for changes in ({'rpm': True}, {'rpm': '4000'}, {'rpm': 0}, {'owner_uid': -1},
+                        {'owner_uid': True}, {'schema_version': True}, {'mode': 'unknown'},
+                        {'extra': 'field'}, {'generation': '../profile'}):
+            with self.subTest(changes=changes):
+                (self.persistence / 'preference.json').write_text(json.dumps({**manual, **changes}))
+                self.assertIsNotNone(broker.load_preference()[1])
+
 
 
 
@@ -444,6 +582,42 @@ class Security(unittest.TestCase):
                 hardware.write(path, 4000)
             self.assertEqual(path.read_text(), '4000\n')
             self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
+    def test_saved_preference_symlink_is_rejected_without_touching_target(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            evidence = directory / 'evidence'
+            evidence.write_text('do not modify')
+            (directory / 'preference.json').symlink_to(evidence)
+            with mock.patch.object(broker, 'PERSISTENCE', directory), mock.patch.object(broker, 'secure_persistence'):
+                preference, error = broker.load_preference()
+                self.assertEqual(preference['mode'], 'auto')
+                self.assertIsNotNone(error)
+                with self.assertRaises(OSError):
+                    broker.save_preference(broker.preference_default())
+            self.assertEqual(evidence.read_text(), 'do not modify')
+
+    def test_saved_preference_directory_symlink_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / 'actual'
+            directory.mkdir()
+            link = Path(root) / 'link'
+            link.symlink_to(directory, target_is_directory=True)
+            with mock.patch.object(broker, 'PERSISTENCE', link):
+                self.assertIsNotNone(broker.load_preference()[1])
+                with self.assertRaisesRegex(RuntimeError, 'directory'):
+                    broker.save_preference(broker.preference_default())
+
+    def test_duplicate_json_fields_and_excessive_nesting_are_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'state'
+            def fixture_open(path, writable=False):
+                return os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            with mock.patch.object(broker, 'secure_regular', fixture_open):
+                for payload in ('{"mode":"auto","mode":"manual"}', '{"a":' + '[' * 2000 + '0' + ']' * 2000 + '}'):
+                    path.write_text(payload)
+                    with self.assertRaisesRegex(RuntimeError, 'Invalid broker JSON'):
+                        broker.read_json(path)
 
     @unittest.skipIf(os.getuid() == 0, 'Requires an unprivileged test runner')
     def test_user_owned_state_refused(self):

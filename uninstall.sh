@@ -41,11 +41,16 @@ if [[ ! -x "$broker" ]]; then
   echo 'No installed broker found. No root files were removed.'
   exit 0
 fi
-# All account permissions are removed only after a successful hardware release.
+# First verify physical release without erasing the saved preference.
+elevate "$broker" release
+# Inhibit queued/new manual commands while the control permission is removed.
+elevate "$broker" sleep
+elevate /usr/bin/rm -f /etc/sudoers.d/apple-silicon-fan-control
+# Only an acknowledged release permits clearing the durable manual setting.
 elevate "$broker" auto
 elevate /usr/bin/systemctl disable --now apple-silicon-fan-watchdog.service apple-silicon-fan-sleep.service
-# This second release also covers older services whose stop path differed.
-elevate "$broker" auto
-elevate /usr/bin/rm -f /etc/sudoers.d/apple-silicon-fan-control /etc/tmpfiles.d/macsmc-fan.conf /etc/systemd/system/apple-silicon-fan-watchdog.service /etc/systemd/system/apple-silicon-fan-sleep.service /usr/local/libexec/apple-silicon-fan-control
+# Stopping/restarting a service never changes saved intent. Verify release again.
+elevate "$broker" release
+elevate /usr/bin/rm -f /etc/sudoers.d/apple-silicon-fan-control /etc/tmpfiles.d/macsmc-fan.conf /etc/systemd/system/apple-silicon-fan-watchdog.service /etc/systemd/system/apple-silicon-fan-sleep.service /usr/local/libexec/apple-silicon-fan-control /var/lib/apple-silicon-fan-control/preference.json /run/apple-silicon-fan-control/state.json /run/apple-silicon-fan-control/watchdog.json
 elevate /usr/bin/systemctl daemon-reload
 echo 'Removed optional manual fan control. Firmware automatic cooling was restored.'

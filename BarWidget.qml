@@ -10,6 +10,7 @@ BarWidget {
     id: root
     moduleName: "io.github.lukasmoriarty.applesiliconthermals"
     property bool popupOpen: false
+    property bool detailsOpen: false
     property bool dataValid: false
     property bool isAppleSilicon: true
     property bool hasFan: false
@@ -30,18 +31,25 @@ BarWidget {
     property string readError: ""
     property string controlError: ""
     property string controlStatusError: ""
+    property string controlNotice: ""
     property string warningText: ""
     property bool writeBusy: false
     property bool readBusy: false
     property string pendingTarget: ""
-    property bool leaseArmed: false
-    property string leaseGeneration: ""
+    property bool persistentControl: false
+    property string savedMode: "unknown"
+    property var savedRpm: null
+    property string pausedReason: ""
+    property string preferenceError: ""
     property bool leaseRecovering: false
     readonly property string helperPath: decodeURIComponent(Qt.resolvedUrl("helper.sh").toString().replace(/^file:\/\//, ""))
     readonly property bool spinIcon: setting("spinIcon", true) === true
     readonly property int quietRpm: snapSpeed(fanMax * 0.25)
     readonly property int regularRpm: snapSpeed(fanMax * 0.5)
     readonly property int maxRpm: fanMax
+    readonly property bool desiredManual: persistentControl && savedMode === "manual"
+    readonly property bool preferenceConfirmed: dataValid && persistentControl && preferenceError === "" && (savedMode === "auto" || (savedMode === "manual" && savedRpm !== null))
+    readonly property int selectedRpm: snapSpeed(savedRpm !== null ? savedRpm : fanTarget !== null ? fanTarget : quietRpm)
     readonly property string modeText: strings.t(leaseRecovering ? "recovering" : mode === "manual" ? "manual" : mode === "auto" ? "auto" : "unknown")
     readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
 
@@ -66,7 +74,6 @@ BarWidget {
         powerWatts = null
         fans = []
         sensors = ({})
-        leaseArmed = false
         leaseRecovering = false
         readError = message
         warningText = ""
@@ -78,6 +85,12 @@ BarWidget {
             deviceModel = data.deviceModel
             controlAvailable = data.controlAvailable
             controlStatusError = data.controlError
+            controlNotice = data.controlNotice
+            persistentControl = data.persistent
+            savedMode = data.savedMode
+            savedRpm = data.savedRpm
+            pausedReason = data.pausedReason
+            preferenceError = data.preferenceError
             if (data.error) {
                 invalidate(data.error === "unsupported_hardware" ? strings.t("unsupported") : data.error === "macsmc_hwmon_missing" ? strings.t("driverMissing") : (data.errorMessage || strings.t("readFailed")))
                 return
@@ -99,11 +112,6 @@ BarWidget {
             readError = ""
             warningText = data.warnings.join("\n")
             freshness.restart()
-            var sameLease = data.leaseOwned && leaseGeneration !== "" && data.generation === leaseGeneration
-            // A journaled, bounded repair temporarily reports unknown mode. Keep
-            // renewing only our already-armed generation while its broker owns
-            // that repair; all other unknown/unavailable states fail closed.
-            if (!sameLease || !((mode === "manual" && fanControlEnabled) || data.leaseRecovering)) leaseArmed = false
         } catch (error) {
             invalidate(strings.t("readFailed"))
         }
@@ -123,7 +131,6 @@ BarWidget {
         var value = String(target)
         if (!/^(auto|[1-7][0-9]{3})$/.test(value)) return
         if (value === "auto") {
-            leaseArmed = false
             if (!controlAvailable) return
         } else if (!fanControlEnabled || !dataValid || pendingTarget === "auto" || (writeBusy && writeProc.targetSpeed === "auto")) return
         pendingTarget = value
@@ -185,7 +192,6 @@ BarWidget {
         interval: 5000
         onTriggered: {
             writeProc.timedOut = true
-            root.leaseArmed = false
             writeProc.running = false
             root.controlError = strings.t("writeTimeout")
             if (root.pendingTarget !== "auto") root.pendingTarget = ""
@@ -205,51 +211,29 @@ BarWidget {
             writeDeadline.stop()
             Qt.callLater(function() {
                 if (code !== 0 || writeProc.timedOut) {
-                    root.leaseArmed = false
                     if (!writeProc.timedOut) {
                         var detail = writeProc.buffer.trim()
                         try { detail = JSON.parse(writeProc.output).error || detail } catch (error) {}
                         root.controlError = Telemetry.boundedText(detail, 240) || strings.t("writeFailed")
                     }
                     if (root.pendingTarget !== "auto") root.pendingTarget = ""
-                } else if (writeProc.targetSpeed !== "auto" && root.pendingTarget !== "auto") {
+                } else {
                     try {
                         var reply = JSON.parse(writeProc.output)
-                        if (reply.mode !== "manual" || !/^[0-9a-f]{32}$/.test(reply.generation)) throw new Error("Invalid lease acknowledgment")
-                        root.leaseGeneration = reply.generation
-                        root.leaseArmed = true
+                        if (reply.persistent !== true || ["auto", "manual"].indexOf(reply.saved_mode) < 0) throw new Error("Invalid saved preference acknowledgment")
+                        root.persistentControl = true
+                        root.savedMode = reply.saved_mode
+                        root.savedRpm = Telemetry.integer(reply.saved_rpm, 1000, 7999)
                     } catch (error) {
-                        root.leaseArmed = false
                         root.controlError = strings.t("writeFailed")
                     }
-                } else root.leaseArmed = false
+                }
                 root.writeBusy = false
                 root.refresh()
                 root.startPending()
             })
         }
     }
-    Timer {
-        interval: 3000
-        running: root.leaseArmed && root.dataValid
-        repeat: true
-        onTriggered: if (!heartbeat.running) { heartbeat.generation = root.leaseGeneration; heartbeat.running = true; heartbeatDeadline.restart() }
-    }
-    Timer {
-        id: heartbeatDeadline
-        interval: 3000
-        onTriggered: { root.leaseArmed = false; heartbeat.running = false; root.controlError = strings.t("heartbeatFailed") }
-    }
-    Process {
-        id: heartbeat
-        property string generation: ""
-        command: [root.helperPath, "heartbeat", generation]
-        onExited: function(code) {
-            heartbeatDeadline.stop()
-            if (code !== 0 && root.leaseArmed) { root.leaseArmed = false; root.controlError = strings.t("heartbeatFailed"); root.refresh() }
-        }
-    }
-
     implicitWidth: button.implicitWidth
     implicitHeight: button.implicitHeight
     BarIconButton {
@@ -290,7 +274,7 @@ BarWidget {
         bar: root.bar
         owner: root
         open: root.popupOpen
-        contentWidth: fittedContentWidth(Style.space(380))
+        contentWidth: fittedContentWidth(Style.space(450))
         contentHeight: fittedContentHeight(mainCol.implicitHeight)
         onOpenChanged: if (open) Qt.callLater(function() { focusScope.forceActiveFocus() })
         FocusScope {
@@ -307,85 +291,209 @@ BarWidget {
                 Column {
                     id: mainCol
                     width: scroll.width
-                    spacing: Style.space(10)
-                    ThermalText { width: parent.width; text: strings.t("title"); font.pixelSize: Style.font.body; font.bold: true }
-                    ThermalText { width: parent.width; text: root.deviceModel; color: Commons.Color.muted; visible: text !== "" }
-                    PanelSeparator { width: parent.width }
-                    ThermalText { width: parent.width; visible: root.readError !== ""; text: root.readError; color: Commons.Color.urgent }
-                    ThermalText { width: parent.width; visible: root.controlError !== ""; text: root.controlError; color: Commons.Color.urgent }
-                    ThermalText { width: parent.width; visible: root.controlStatusError !== ""; text: root.controlStatusError; color: Commons.Color.urgent }
-                    ThermalText { width: parent.width; visible: root.warningText !== ""; text: root.warningText; color: Commons.Color.muted }
-                    ThermalText { width: parent.width; visible: !root.dataValid && root.readError === ""; text: strings.t("loading") }
-                    Column {
+                    spacing: Style.space(14)
+
+                    Row {
                         width: parent.width
-                        visible: root.dataValid
-                        spacing: Style.space(8)
-                        ThermalText { width: parent.width; text: root.hasFan ? root.modeText : strings.t("fanless"); color: root.manualMode ? Commons.Color.accent : root.foreground; font.pixelSize: Style.font.body }
-                        Repeater {
-                            model: root.fans
-                            Column {
-                                required property var modelData
-                                width: mainCol.width
-                                spacing: Style.space(2)
-                                ThermalText { width: parent.width; text: modelData.label || strings.t("fanFallback").arg(root.formatNumber(modelData.index)); font.bold: true }
-                                ThermalText { width: parent.width; text: strings.t("fanSummary").arg(root.formatRpm(modelData.rpm)).arg(root.formatRpm(modelData.target)).arg(root.formatRpm(modelData.min)).arg(root.formatRpm(modelData.max)) }
-                            }
-                        }
-                        ThermalText { width: parent.width; text: strings.t("componentMax").arg(root.formatNumber(root.maxTemp, 1)); font.bold: true }
-                        ThermalText { width: parent.width; text: strings.t("systemPower").arg(root.formatNumber(root.powerWatts, 2)) }
-                        ThermalText { width: parent.width; text: strings.t("sensorNote"); color: Commons.Color.muted }
-                        Repeater {
-                            model: ["nand", "battery", "regulator", "wifi"]
-                            ThermalText { required property string modelData; width: mainCol.width; text: strings.t(modelData).arg(root.formatNumber(root.sensors[modelData], 1)) }
-                        }
-                        PanelSeparator { width: parent.width; visible: root.hasFan }
-                        ThermalText { width: parent.width; visible: root.hasFan; text: strings.t(root.fanControlEnabled ? "leaseNote" : "setup"); color: Commons.Color.muted }
-                        Flow {
-                            width: parent.width
-                            spacing: Style.space(6)
-                            visible: root.hasFan && root.fanControlEnabled
-                            Repeater {
-                                model: [{key: "quiet", rpm: root.quietRpm}, {key: "regular", rpm: root.regularRpm}, {key: "maximum", rpm: root.maxRpm}]
-                                Button {
-                                    required property var modelData
-                                    text: strings.t(modelData.key)
-                                    focusable: true
-                                    enabled: !root.writeBusy
-                                    selected: root.manualMode && root.fanTarget !== null && Math.abs(root.fanTarget - modelData.rpm) < 25
-                                    onClicked: root.setSpeed(modelData.rpm)
-                                }
-                            }
+                        spacing: Style.space(10)
+                        BorderSurface {
+                            id: headerIcon
+                            width: Style.space(36); height: width
+                            radius: Style.cornerRadius
+                            color: Style.selectedFillFor(root.foreground, Commons.Color.accent)
+                            ThermalText { anchors.centerIn: parent; text: "󰈐"; font.pixelSize: Style.font.subtitle; color: Commons.Color.accent }
                         }
                         Column {
-                            width: parent.width
-                            visible: root.hasFan && root.fanControlEnabled
-                            ThermalText { width: parent.width; text: strings.t("target").arg(root.formatRpm(root.snapSpeed(rpmSlider.liveValue))) }
-                            PanelSlider {
-                                id: rpmSlider
-                                width: parent.width
-                                bar: root.bar
-                                minimum: root.fanMin; maximum: root.fanMax; step: 50; integer: true
-                                enabled: !root.writeBusy
-                                activeFocusOnTab: true
-                                value: root.fanTarget !== null ? root.snapSpeed(root.fanTarget) : root.quietRpm
-                                onReleased: function(value) { root.setSpeed(root.snapSpeed(value)) }
-                                Keys.onPressed: function(event) {
-                                    var key = Util.readingKey(event)
-                                    var target = key === Qt.Key_Left ? liveValue - step : key === Qt.Key_Right ? liveValue + step : key === Qt.Key_Home ? minimum : key === Qt.Key_End ? maximum : null
-                                    if (target !== null) { liveValue = root.snapSpeed(target); root.setSpeed(liveValue); event.accepted = true }
-                                }
+                            width: parent.width - headerIcon.width - headerActions.width - parent.spacing * 2
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Style.space(3)
+                            ThermalText { width: parent.width; text: strings.t("title"); font.pixelSize: Style.font.body; font.bold: true }
+                            ThermalText { width: parent.width; text: root.deviceModel || strings.t("loading"); color: Commons.Color.muted; maximumLineCount: 2; elide: Text.ElideRight }
+                        }
+                        Row {
+                            id: headerActions
+                            spacing: Style.space(2)
+                            Button { text: "󰑐"; fontSize: Style.font.body; horizontalPadding: Style.space(7); tooltipText: strings.t("refresh"); Accessible.name: strings.t("refresh"); focusable: true; enabled: !root.readBusy; onClicked: root.refresh() }
+                            Button { text: "×"; fontSize: Style.font.body; horizontalPadding: Style.space(7); tooltipText: strings.t("close"); Accessible.name: strings.t("close"); focusable: true; onClicked: root.close() }
+                        }
+                    }
+
+                    BorderSurface {
+                        width: parent.width
+                        radius: Style.cornerRadius
+                        color: Style.normalFillFor(root.foreground, Commons.Color.accent)
+                        borderSpec: Border.flat(Util.alpha(root.foreground, 0.10), 1)
+                        height: stateRow.implicitHeight + Style.space(16)
+                        Row {
+                            id: stateRow
+                            anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                            anchors.margins: Style.space(8)
+                            spacing: Style.space(8)
+                            Rectangle { width: Style.space(6); height: width; radius: width / 2; color: !root.dataValid ? Commons.Color.muted : root.manualMode ? Commons.Color.accent : root.desiredManual && root.mode !== "manual" ? Commons.Color.urgent : root.foreground; anchors.verticalCenter: parent.verticalCenter }
+                            ThermalText { width: parent.width - stateBadge.implicitWidth - Style.space(22); text: !root.dataValid ? strings.t("unavailable") : root.writeBusy ? strings.t("saving") : root.desiredManual && root.mode !== "manual" && !root.leaseRecovering ? strings.t("paused") : root.modeText; font.bold: true }
+                            ThermalText { id: stateBadge; text: root.preferenceConfirmed ? "✓ " + strings.t("saved") : strings.t("live"); color: Commons.Color.muted; anchors.verticalCenter: parent.verticalCenter }
+                        }
+                    }
+
+                    BorderSurface {
+                        width: parent.width
+                        visible: root.readError !== "" || root.controlError !== "" || root.controlStatusError !== "" || root.preferenceError !== ""
+                        height: errorText.implicitHeight + Style.space(20)
+                        radius: Style.cornerRadius
+                        color: Util.alpha(Commons.Color.urgent, 0.10)
+                        borderSpec: Border.flat(Util.alpha(Commons.Color.urgent, 0.5), 1)
+                        ThermalText { id: errorText; anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top; anchors.margins: Style.space(10); text: [root.readError, root.controlError, root.controlStatusError, root.preferenceError].filter(function(value) { return value !== "" }).join("\n"); color: Commons.Color.urgent }
+                    }
+
+                    Grid {
+                        id: fanGrid
+                        width: parent.width
+                        visible: root.dataValid && root.hasFan
+                        columns: width < Style.space(330) || root.fans.length === 1 ? 1 : 2
+                        spacing: Style.space(10)
+                        Repeater {
+                            model: root.fans
+                            FanCard {
+                                required property var modelData
+                                width: (fanGrid.width - fanGrid.spacing * (fanGrid.columns - 1)) / fanGrid.columns
+                                nameText: modelData.label || strings.t("fanFallback").arg(root.formatRpm(modelData.index))
+                                speedText: root.formatRpm(modelData.rpm)
+                                fraction: modelData.rpm !== null && modelData.max !== null && modelData.max > 0 ? modelData.rpm / modelData.max : 0
+                                percentText: modelData.rpm !== null && modelData.max !== null && modelData.max > 0 ? strings.t("percent").arg(root.formatNumber(Math.min(100, Math.round(fraction * 100)))) : "—"
+                                targetText: strings.t("fanTarget").arg(root.formatRpm(modelData.target))
+                                rangeText: strings.t("fanRange").arg(root.formatRpm(modelData.min)).arg(root.formatRpm(modelData.max))
                             }
                         }
                     }
-                    Flow {
+
+                    Grid {
+                        id: metrics
+                        width: parent.width
+                        visible: root.dataValid
+                        columns: width < Style.space(260) ? 1 : 2
+                        spacing: Style.space(10)
+                        MetricCard { width: (metrics.width - metrics.spacing * (metrics.columns - 1)) / metrics.columns; labelText: strings.t("componentLabel"); valueText: root.formatNumber(root.maxTemp, 1); unitText: "°C"; iconText: "󰔏"; valueColor: root.maxTemp !== null && root.maxTemp >= 80 ? Commons.Color.urgent : root.foreground }
+                        MetricCard { width: (metrics.width - metrics.spacing * (metrics.columns - 1)) / metrics.columns; labelText: strings.t("powerLabel"); valueText: root.formatNumber(root.powerWatts, 1); unitText: "W"; iconText: "󰚥" }
+                    }
+
+                    Column {
+                        width: parent.width
+                        visible: root.hasFan || root.controlAvailable || root.desiredManual
+                        spacing: Style.space(10)
+                        ThermalText { width: parent.width; text: strings.t("coolingLabel"); font.pixelSize: Style.font.body; font.bold: true }
+                        BorderSurface {
+                            width: parent.width
+                            height: modeButtons.implicitHeight + Style.space(8)
+                            radius: Style.cornerRadius
+                            color: Style.normalFillFor(root.foreground, Commons.Color.accent)
+                            borderSpec: Border.flat(Util.alpha(root.foreground, 0.10), 1)
+                            Row {
+                                id: modeButtons
+                                anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+                                anchors.margins: Style.space(4)
+                                spacing: Style.space(4)
+                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("autoButton"); iconText: "󰒓"; focusable: true; enabled: root.controlAvailable; selected: !root.desiredManual && root.mode === "auto"; onClicked: root.setSpeed("auto") }
+                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("manualButton"); iconText: "󰒺"; focusable: true; enabled: root.fanControlEnabled && !root.writeBusy; selected: root.desiredManual; onClicked: root.setSpeed(root.savedRpm !== null ? root.snapSpeed(root.savedRpm) : root.snapSpeed(root.fanRpm !== null && root.fanRpm >= root.fanMin ? root.fanRpm : root.quietRpm)) }
+                            }
+                        }
+
+                        Column {
+                            width: parent.width
+                            visible: root.desiredManual
+                            spacing: Style.space(12)
+                            Item {
+                                width: parent.width
+                                height: targetValue.implicitHeight
+                                Column {
+                                    id: targetValue
+                                    spacing: Style.space(3)
+                                    ThermalText { text: strings.t(root.fanCount === 2 ? "targetBoth" : root.fanCount > 2 ? "targetAll" : "targetLabel"); color: Commons.Color.muted }
+                                    Row {
+                                        spacing: Style.space(5)
+                                        ThermalText { text: root.formatRpm(root.snapSpeed(rpmSlider.liveValue)); font.pixelSize: Style.font.title; font.bold: true; color: Commons.Color.accent }
+                                        ThermalText { text: "RPM"; color: Commons.Color.muted; anchors.bottom: parent.bottom; anchors.bottomMargin: Style.space(3) }
+                                    }
+                                }
+                                ThermalText { anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; text: strings.t("ofMaximum").arg(root.formatNumber(Math.round(root.snapSpeed(rpmSlider.liveValue) / root.fanMax * 100))); color: Commons.Color.muted }
+                            }
+                            Column {
+                                width: parent.width
+                                spacing: Style.space(4)
+                                PanelSlider {
+                                    id: rpmSlider
+                                    width: parent.width
+                                    bar: root.bar
+                                    minimum: root.fanMin; maximum: root.fanMax; step: 50; integer: true
+                                    enabled: root.fanControlEnabled && !root.writeBusy
+                                    activeFocusOnTab: true
+                                    Accessible.name: strings.t("targetLabel")
+                                    value: root.selectedRpm
+                                    onReleased: function(value) { root.setSpeed(root.snapSpeed(value)) }
+                                    Keys.onPressed: function(event) {
+                                        var key = Util.readingKey(event)
+                                        var target = key === Qt.Key_Left ? liveValue - step : key === Qt.Key_Right ? liveValue + step : key === Qt.Key_Home ? minimum : key === Qt.Key_End ? maximum : null
+                                        if (target !== null) { liveValue = root.snapSpeed(target); root.setSpeed(liveValue); event.accepted = true }
+                                    }
+                                }
+                                Item {
+                                    width: parent.width; height: minLabel.implicitHeight
+                                    ThermalText { id: minLabel; anchors.left: parent.left; text: strings.t("minimumRpm").arg(root.formatRpm(root.fanMin)); color: Commons.Color.muted }
+                                    ThermalText { anchors.right: parent.right; text: strings.t("maximumRpm").arg(root.formatRpm(root.fanMax)); color: Commons.Color.muted }
+                                }
+                            }
+                            Row {
+                                width: parent.width
+                                spacing: Style.space(8)
+                                Repeater {
+                                    model: [{key:"quiet",rpm:root.quietRpm,glyph:"󰒲"}, {key:"balanced",rpm:root.regularRpm,glyph:"󰈐"}, {key:"maximum",rpm:root.maxRpm,glyph:"󰓅"}]
+                                    SpeedPreset {
+                                        required property var modelData
+                                        width: (mainCol.width - Style.space(16)) / 3
+                                        title: strings.t(modelData.key)
+                                        detail: strings.t("rpm").arg(root.formatRpm(modelData.rpm))
+                                        glyph: modelData.glyph
+                                        selected: Math.abs(root.selectedRpm - modelData.rpm) < 25
+                                        enabled: root.fanControlEnabled && !root.writeBusy
+                                        onClicked: root.setSpeed(modelData.rpm)
+                                    }
+                                }
+                            }
+                            ThermalText { width: parent.width; visible: root.preferenceConfirmed; text: "✓ " + strings.t("remembered"); color: Commons.Color.muted }
+                        }
+                        ThermalText { width: parent.width; visible: !root.desiredManual && root.mode === "auto"; text: strings.t("automaticNote"); color: Commons.Color.muted }
+                        ThermalText { width: parent.width; visible: !root.persistentControl || !root.controlAvailable; text: strings.t(root.persistentControl ? "controlUnavailable" : "setup"); color: Commons.Color.muted }
+                        ThermalText { width: parent.width; visible: root.pausedReason !== ""; text: root.pausedReason; color: Commons.Color.urgent }
+                    }
+
+                    PanelSeparator { width: parent.width }
+                    Column {
                         width: parent.width
                         spacing: Style.space(8)
-                        Button { text: strings.t("autoButton"); focusable: true; visible: root.controlAvailable; selected: root.mode === "auto"; onClicked: root.setSpeed("auto") }
-                        Button { text: strings.t("refresh"); focusable: true; onClicked: root.refresh() }
-                        Button { text: strings.t("close"); focusable: true; onClicked: root.close() }
+                        Button { width: parent.width; text: strings.t("sensorDetails"); iconText: root.detailsOpen ? "󰅃" : "󰅀"; leftAlign: true; focusable: true; selected: root.detailsOpen; onClicked: root.detailsOpen = !root.detailsOpen }
+                        Grid {
+                            id: sensorGrid
+                            width: parent.width
+                            visible: root.detailsOpen && root.dataValid
+                            columns: width < Style.space(330) ? 1 : 2
+                            spacing: Style.space(8)
+                            Repeater {
+                                model: ["nand", "battery", "regulator", "wifi"]
+                                Column {
+                                    required property string modelData
+                                    width: (sensorGrid.width - sensorGrid.spacing * (sensorGrid.columns - 1)) / sensorGrid.columns
+                                    spacing: Style.space(3)
+                                    ThermalText { width: parent.width; text: strings.t(modelData + "Label"); color: Commons.Color.muted }
+                                    ThermalText { width: parent.width; text: strings.t("temperature").arg(root.formatNumber(root.sensors[modelData], 1)); font.bold: true }
+                                }
+                            }
+                        }
+                        ThermalText { width: parent.width; visible: root.detailsOpen; text: strings.t("sensorNote"); color: Commons.Color.muted }
+                        ThermalText { width: parent.width; visible: root.detailsOpen && root.warningText !== ""; text: root.warningText; color: Commons.Color.muted }
+                        ThermalText { width: parent.width; visible: root.detailsOpen && root.controlNotice !== ""; text: root.controlNotice; color: Commons.Color.muted }
                     }
                 }
             }
         }
     }
+
 }

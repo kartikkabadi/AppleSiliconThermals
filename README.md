@@ -7,7 +7,8 @@ supervised hardware override.
 
 This fork builds on [LukasMoriarty/AppleSiliconThermals](https://github.com/LukasMoriarty/AppleSiliconThermals)
 and retains its MIT license. Version 2 replaces the original shell telemetry and
-unbounded manual override with validated JSON and expiring control leases.
+unbounded manual override with validated JSON and supervised fan control.
+Version 2.1 remembers your selected mode and RPM across bar restarts and reboot.
 
 ## Requirements and support
 
@@ -60,7 +61,7 @@ Use the popup to view each fan's actual speed, target and hardware limits.
 Monitoring-only installations display the fan mode as **unknown** because the
 kernel does not expose the SMC mode. A positive target RPM is not evidence of
 manual operation. The supervised service reports its last successful Auto reset
-or its own active manual lease; it cannot prove what an unrelated fan tool does
+or its own active manual setting; it cannot prove what an unrelated fan tool does
 later. Run only one fan-control system at a time.
 
 ## Optional manual control
@@ -78,7 +79,7 @@ From the reviewed checkout, run **as your normal desktop user**:
 
 Do not use `sudo ./setup.sh`. The installer copies the broker and service units
 into root-owned locations with standard `install` commands. It starts the
-watchdog, verifies that an automatic reset succeeded, then grants only the
+watchdog, verifies that cooling control is ready, then grants only the
 installing account passwordless access to the bounded broker actions. Other
 local accounts do not receive this permission. Interactive terminals use sudo;
 noninteractive callers first try `sudo -n`, then use `pkexec` only when sudo
@@ -89,69 +90,96 @@ Installation can fail after creating root files, for example if hardware reset
 fails; the account permission is granted only after the service is ready.
 Resolve the reported error before retrying, or use the uninstall procedure.
 
-### How manual control works
+### Remembered mode and RPM
 
-- Numeric requests are limited to four-digit RPM values from 1000 through 7999.
-  The broker clamps the request separately to each fan's hardware minimum and
-  maximum. The UI disables manual controls for incompatible/missing limits.
-- This is a fixed target, **not a temperature-driven curve**. Quiet and Regular
-  derive from 25%/50% of the highest detected fan maximum; each fan is clamped
-  independently. Maximum uses the real detected maximum.
-- The root broker serializes all operations with a lock and validates all fans
-  before a manual write. A partial failure attempts automatic recovery for all
-  fans. If recovery fails, state remains unknown and further manual requests
-  are refused until recovery succeeds.
-- Each manual request creates a new 12-second lease tied to the caller UID and
-  a random generation ID. Only the initiating widget renews that exact lease,
-  every 3 seconds. Removing the widget, shell failure, read failure or a stale
-  generation stops renewal.
-- A separate root watchdog checks every 2 seconds. It releases expired leases
-  and invalid or hot component readings (80 C). A transient target mismatch
-  triggers a verified attempt to restore your selected RPM, preserving the
-  same owner, lease ID and deadline. This first releases then reacquires manual
-  mode to repair stale kernel mode state. At most two repairs are attempted in
-  30 seconds; failed verification or repeated overrides return to Auto with
-  exact requested/observed values in the error. It does not fight an indefinite
-  hardware override. Your selection otherwise stays in manual while the
-  healthy widget renews it; the 12 seconds are a failure deadline, not a limit
-  on how long you can use manual control.
-- systemd monitors the watchdog with an 8-second watchdog timeout and restarts
-  it after failure. Stop/failure handling attempts Auto. This cannot guarantee
-  recovery if the kernel, systemd or hardware itself is unresponsive.
-- A sleep guard inhibits requests before suspend and attempts Auto. Resume
-  must successfully restore Auto before new manual requests are accepted.
-  Lease expiry uses a boot-specific clock that includes time spent suspended.
-- Auto first writes a valid per-fan maximum, then zero, to force the kernel's
-  cached mode through a known transition. This can briefly increase fan speed.
-  The workaround has fixture coverage; real suspend/resume testing is still
-  required on each kernel/model.
+Choosing Manual, a preset, or the slider saves your chosen RPM. The root control
+service maintains it independently of the widget and restores it after service
+restart, shell restart, login and reboot. Closing the popup or disabling the
+widget does not change the saved choice. Choose **Auto** to save automatic
+firmware control instead. A reboot begins with an automatic reset, then applies
+the saved manual setting after validating the available hardware and sensors.
 
-Root paths are fixed. The privileged program accepts no alternate sysfs roots
-or executable paths from arguments/environment. Status reads root-owned state
-without sudo. The policy grants no `watchdog`, `sleep` or `resume` actions to the
-user. Runtime JSON is bounded and published atomically under `/run`.
+The preference is an atomic, root-owned JSON file at:
+
+```text
+/var/lib/apple-silicon-fan-control/preference.json
+```
+
+The file records mode, requested RPM and the requesting account. It does not
+contain executable code or arbitrary paths. Writes include file and directory
+synchronization so an acknowledged choice is durable. Runtime state under
+`/run` is separate; discarding runtime state does not discard your preference.
+The popup distinguishes your saved choice from the current hardware mode. A
+safety pause retains the choice and explains why it is temporarily inactive.
+
+### Hardware control and recovery
+
+- Requests are four-digit RPM values from 1000 through 7999. Each fan is clamped
+  to its own hardware range. Maximum uses the real highest detected maximum;
+  the other fan may have a lower limit. The shared slider controls both fans.
+- These are fixed RPM settings, not temperature curves. Quiet and Balanced are
+  25% and 50% of the highest maximum, clamped per fan.
+- The broker serializes all writes and validates all channels before a change.
+  A write journal marks incomplete changes as unknown so interrupted requests
+  trigger recovery rather than leaving a false success state.
+- Initial manual application forces a known driver-mode transition and verifies
+  target readback. Physical fan RPM can take a few seconds to reach the target.
+- The service checks hardware every 2 seconds. Transient target drift gets at
+  most two verified repairs within 30 seconds. Repeated refusal pauses manual
+  control with the requested and observed values; a cooldown prevents continuous
+  attempts to fight firmware or another controller.
+- Invalid/missing/hot component readings temporarily release to firmware. The
+  saved manual choice remains. Restoration requires healthy readings below the
+  lower resume threshold and a cooldown, preventing rapid mode oscillation.
+- systemd supervises the service with an 8-second watchdog deadline. If it
+  crashes or stalls, stop handling attempts firmware control; the restarted
+  service then validates and reapplies the saved choice. If the kernel or
+  hardware is unresponsive, software recovery cannot guarantee cooling.
+- Sleep inhibits new requests and releases control. Resume marks the system
+  awake and retries any failed automatic reset; the service restores a saved
+  manual preference only after cooling is in a known, eligible state. Internal release, sleep and shutdown never overwrite your choice.
+- Explicit user Auto is saved before hardware release. A crash during that
+  release therefore cannot resurrect an older manual preference. A numeric
+  choice is committed only after successful target application and verification.
+- Corrupt or insecure preference data fails closed to Auto with a diagnostic.
+  It is not executed, silently trusted, or treated as a valid manual setting.
+
+The temperatures exposed here are peripheral/component readings, not processor
+die temperatures. The kernel marks manual fan control unsafe because a safe
+outcome under every overheating failure cannot be proven. Mechanical RPM bounds
+and software recovery are useful protections, not a hardware safety guarantee.
+
+Root paths are fixed. Privileged actions cannot accept alternate sysfs roots or
+executables through arguments/environment. The single-account sudo policy only
+grants bounded user actions; internal `watchdog`, `release`, `sleep` and `resume`
+actions remain root-only. Status reads require no sudo. Older lease-based control
+services must be upgraded before this widget enables numeric manual controls.
 
 ## Settings and accessibility
 
 Set `"spinIcon": false` in this widget's `bar.layout` entry in
 `~/.config/omarchy/shell.json` to disable the fan animation. The animation also
 follows Omarchy's reduce-motion preference. The popup scrolls to fit smaller
-screens; it supports Escape and focusable controls. English strings are in
+screens; it supports Escape and focusable controls. Fan cards distinguish
+current RPM from target RPM, while gauges show speed relative to each fan maximum.
+A single Auto/Manual selector replaces duplicate actions; preset cards show
+their target RPM and component details can be expanded when needed. English strings are in
 `i18n/en.json`; the selected Omarchy language falls back to English until its
 catalog is supplied. Sensor/model names are displayed as plain text.
 
-## Recovery after a failed sleep reset
+## Saved settings during a safety pause
 
-If a hardware error prevents the sleep guard from restoring Auto, it deliberately
-keeps manual requests inhibited. After fixing the cause, an administrator can
-retry the protected recovery:
+If a sensor or hardware error prevents manual control, the saved setting stays
+visible while actual control temporarily returns to firmware. The service retries
+after a cooldown and restores the saved target only when readings are healthy.
+Repeated firmware refusals are not retried continuously. Choose Auto to replace
+the saved manual choice; choosing another manual target saves the new value only
+after verification.
 
-```bash
-sudo /usr/local/libexec/apple-silicon-fan-control resume
-```
-
-It restores Auto before clearing the guard. Ordinary user Auto cannot clear the
-sleep guard because that would reopen the race with an in-progress suspend.
+A failed attempt to save Auto is reported explicitly and blocks restoration of
+the older manual setting in runtime state. If storage cannot accept a durable
+write, the last acknowledged file is still the reboot preference; resolve the
+save error rather than treating the failed request as remembered.
 
 ## Remove
 
@@ -162,8 +190,9 @@ widget or its broker**:
 ./uninstall.sh
 ```
 
-This restores Auto, stops/disables the services, restores Auto again and then
-removes the root helper, policy and service files. It refuses to remove the
+This verifies a hardware release, explicitly saves Auto, stops/disables the
+services, verifies Auto again, and removes the root helper, policy, service files
+and saved preference. It refuses to remove the
 helper if the release command fails. It does not remove the bar widget itself.
 If Auto fails, retain the helper, inspect the error and restore known-good
 cooling before removing the control mechanism.
@@ -176,6 +205,9 @@ omarchy plugin remove io.github.lukasmoriarty.applesiliconthermals
 ```
 
 For a monitoring-only install, only the two Omarchy commands are necessary.
+With persistent control installed, removing only the widget intentionally leaves
+the service and your saved fan setting running; uninstall control first when
+you want to return permanently to firmware management.
 
 ## Development and verification
 
@@ -191,11 +223,13 @@ python3 -m py_compile thermal.py system/apple-silicon-fan-control
 Python tests use isolated temporary sysfs/runtime fixtures and do not require
 root or write host fan settings. JavaScript tests validate the QML parser,
 malformed data and markup neutralization. CI runs these on Ubuntu 22.04/24.04.
-The same Python command also runs two headless QML integration tests when
-Omarchy UI modules and Quickshell are installed; otherwise those two tests skip.
+The same Python command also runs three headless QML integration tests when
+Omarchy UI modules and Quickshell are installed; otherwise those three tests skip.
 
 See [VALIDATION.md](VALIDATION.md) for completed physical checks on the M1 Pro,
-including maximum writes, lease expiry and watchdog crash recovery. Real
+including maximum writes and watchdog recovery. Earlier lease-expiry checks
+there describe version 2.0; version 2.1 deliberately owns manual control in the
+service rather than requiring UI heartbeats. Real
 suspend/resume and other models remain separate hardware checks. Passing fixtures or a read-only smoke test is not proof that every Mac,
 kernel and desktop configuration works. Report the model, kernel, Omarchy/Qt
 versions, broker status and relevant service logs when filing an issue; do not

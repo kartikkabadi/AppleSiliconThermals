@@ -42,7 +42,9 @@ def trusted_broker(path: Path = BROKER) -> bool:
             return False
         if info.st_mode & 0o022 or not os.access(path, os.X_OK):
             return False
-        for parent in path.parents:
+        # Inspect physical ancestors too: a root-owned /usr/local/libexec
+        # symlink must not conceal a writable directory elsewhere.
+        for parent in (*path.parents, *path.resolve(strict=True).parents):
             info = parent.stat()
             if info.st_uid != 0 or info.st_mode & 0o022:
                 return False
@@ -92,7 +94,7 @@ def broker_status() -> dict:
         return {**unavailable, 'error': 'Control service protocol is incompatible.'}
     try:
         permitted = subprocess.run(
-            ['/usr/bin/sudo', '-n', '-l', str(BROKER), 'heartbeat', '0' * 32],
+            ['/usr/bin/sudo', '-n', '-l', str(BROKER), 'auto'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=1, check=False,
             env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
@@ -132,17 +134,39 @@ class Telemetry:
         mode = control.get('mode') if control.get('ready') is True else 'unknown'
         if mode not in ('auto', 'manual', 'unknown'):
             mode = 'unknown'
+        persistent = control.get('persistent') is True
+        saved_mode = control.get('saved_mode')
+        if saved_mode not in ('auto', 'manual'):
+            saved_mode = 'unknown'
+        saved_rpm = control.get('saved_rpm')
+        if type(saved_rpm) is not int or not 1000 <= saved_rpm <= 7999:
+            saved_rpm = None
+        requested_rpm = control.get('requested_rpm')
+        if type(requested_rpm) is not int or not 1000 <= requested_rpm <= 7999:
+            requested_rpm = None
+        saved_owner = control.get('saved_owner_uid')
+        if type(saved_owner) is not int or saved_owner < 0:
+            saved_owner = None
+        paused = None
+        if persistent and saved_mode == 'manual' and mode != 'manual':
+            paused = control.get('paused_reason') or control.get('pause_reason') or control.get('error')
+            paused = str(paused)[:1024] if paused else None
         data = {
             'schema_version': 2, 'timestamp_ms': int(time.time() * 1000),
             'is_apple_silicon': apple, 'device_model': (model or ('Apple Silicon Mac' if apple else 'Non-Apple hardware'))[:256],
             'has_fan': False, 'fan_count': 0, 'fans': [], 'fan_rpm': None,
             'fan_min': None, 'fan_max': None, 'fan_target': None,
             'mode': mode, 'manual_mode': mode == 'manual',
+            'persistent': persistent, 'saved_mode': saved_mode, 'saved_rpm': saved_rpm,
+            'saved_owner_uid': saved_owner, 'requested_rpm': requested_rpm,
+            'paused_reason': paused,
+            'preference_error': str(control['preference_error'])[:1024] if control.get('preference_error') else None,
             'control_available': available, 'fan_control_enabled': False,
             'lease_owned': (mode == 'manual' or control.get('recovering') is True) and control.get('owner_uid') == os.getuid(),
             'lease_recovering': control.get('recovering') is True,
             'broker_generation': str(control.get('generation') or '')[:128],
             'control_error': control.get('error'),
+            'control_notice': str(control['notice'])[:1024] if control.get('notice') else None,
             'max_temp': None, 'power_watts': None,
             'sensors': dict.fromkeys(('nand', 'battery', 'regulator', 'wifi')),
             'error': None, 'error_message': None, 'warnings': [],

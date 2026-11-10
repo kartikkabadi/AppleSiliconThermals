@@ -67,30 +67,49 @@ namespace = runpy.run_path(sys.argv[1], run_name='preflight')
 hardware = namespace['Hardware']()
 for _, register in hardware.fans:
     hardware.bounds(register)
-hardware.check_temperatures()
+# Heat/telemetry faults must not prevent upgrading the recovery service.
+# The supervisor keeps Auto and postpones saved manual restoration until healthy.
+store = namespace['PERSISTENCE']
+if store.exists() or store.is_symlink():
+    namespace['secure_persistence']()
+    profile = store / 'preference.json'
+    if profile.exists() or profile.is_symlink():
+        import os
+        descriptor = namespace['secure_regular'](profile)
+        os.close(descriptor)
 PYTHON
 
-echo 'Installing an expiring manual fan-control lease for this account only.'
-echo 'The watchdog will restore automatic cooling before accepting manual requests.'
+echo 'Installing persistent manual fan control for this account only.'
+echo 'Saved settings survive shell restarts and reboot; the root supervisor handles recovery.'
+# Preserve existing acknowledged intent before upgrading any installed component.
+if [[ -f /var/lib/apple-silicon-fan-control/preference.json ]]; then
+  backup_path="/var/lib/apple-silicon-fan-control/backups/preference.$(date -u +%Y%m%dT%H%M%S).$$.json"
+  elevate /usr/bin/install -o root -g root -m 700 -d /var/lib/apple-silicon-fan-control/backups
+  elevate /usr/bin/install -o root -g root -m 600 /var/lib/apple-silicon-fan-control/preference.json "$backup_path"
+  echo "Saved existing preference backup: $backup_path"
+fi
 # Revoke a legacy ALL-user policy before replacing its executable. New
-# permission is granted only after the watchdog establishes automatic cooling.
+# permission is granted only after the supervisor establishes a known cooling state.
 elevate /usr/bin/rm -f /etc/sudoers.d/apple-silicon-fan-control
 # install copies data to root-owned destinations; no checkout code runs as root.
-elevate /usr/bin/install -o root -g root -m 755 -D "$source_dir/system/apple-silicon-fan-control" /usr/local/libexec/apple-silicon-fan-control
 elevate /usr/bin/install -o root -g root -m 644 -D "$source_dir/system/apple-silicon-fan-watchdog.service" /etc/systemd/system/apple-silicon-fan-watchdog.service
 elevate /usr/bin/install -o root -g root -m 644 -D "$source_dir/system/apple-silicon-fan-sleep.service" /etc/systemd/system/apple-silicon-fan-sleep.service
-# Start the independent safety service before reporting setup success.
+# Load release-only lifecycle actions before replacing a legacy executable.
+# Otherwise a previously loaded ExecStopPost=auto could erase saved intent.
 elevate /usr/bin/systemctl daemon-reload
+elevate /usr/bin/install -o root -g root -m 755 -D "$source_dir/system/apple-silicon-fan-control" /usr/local/libexec/apple-silicon-fan-control
+# Start the independent safety service before reporting setup success.
 elevate /usr/bin/systemctl enable apple-silicon-fan-watchdog.service apple-silicon-fan-sleep.service
 elevate /usr/bin/systemctl restart apple-silicon-fan-watchdog.service
 for attempt in {1..20}; do
-  if /usr/local/libexec/apple-silicon-fan-control status | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("ready") and s.get("mode")=="auto" else 1)'; then
+  if /usr/local/libexec/apple-silicon-fan-control status | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("ready") and s.get("mode") in ("auto","manual") else 1)'; then
     break
   fi
   sleep 0.5
 done
-/usr/local/libexec/apple-silicon-fan-control status | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("ready") and s.get("mode")=="auto" else "Watchdog did not establish automatic cooling; no permission was granted")'
+/usr/local/libexec/apple-silicon-fan-control status | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("ready") and s.get("mode") in ("auto","manual") else "Supervisor did not establish a known cooling state; no permission was granted")'
 elevate /usr/bin/install -o root -g root -m 440 -D "$scratch/policy" /etc/sudoers.d/apple-silicon-fan-control
 # Remove the obsolete boot-time unlock only after the supervised setup is ready.
 elevate /usr/bin/rm -f /etc/tmpfiles.d/macsmc-fan.conf
-echo 'Installed. Firmware automatic cooling is active. Manual requests expire without heartbeat.'
+echo 'Installed. The supervisor owns saved settings independently of the widget.'
+/usr/local/libexec/apple-silicon-fan-control status

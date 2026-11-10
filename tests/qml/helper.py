@@ -13,6 +13,7 @@ data = {'is_apple_silicon': True, 'has_fan': True, 'fan_count': 2,
                   'rpm': 2400, 'target': 2300, 'min': 1200, 'max': 5779},
                  {'index': 2, 'label': 'Fan 2', 'rpm': 2500, 'target': 2500, 'min': 1200, 'max': 6241}],
         'mode': 'auto', 'broker_generation': '0' * 32, 'lease_owned': False,
+        'persistent': True, 'saved_mode': 'auto', 'saved_rpm': None,
         'fan_control_enabled': True, 'control_available': True,
         'max_temp': 0, 'power_watts': 0,
         'sensors': {'nand': 0, 'battery': None, 'regulator': 45.5, 'wifi': 41}}
@@ -31,9 +32,12 @@ else:
             print(json.dumps({'error': 'fixture command failure <img src="invalid">'}))
             sys.exit(9)
         data['mode'] = 'auto' if target == 'auto' else 'manual'
+        data['saved_mode'] = data['mode']
+        data['saved_rpm'] = None if target == 'auto' else int(target)
         data['broker_generation'] = 'a' * 32
         data['lease_owned'] = target != 'auto'
         statefile.write_text(json.dumps(data))
     elif action == 'heartbeat' and target != data['broker_generation']:
         sys.exit(1)
-    print(json.dumps({'mode': data['mode'], 'generation': data['broker_generation']}))
+    print(json.dumps({'mode': data['mode'], 'generation': data['broker_generation'], 'persistent': True,
+                      'saved_mode': data['saved_mode'], 'saved_rpm': data['saved_rpm']}))

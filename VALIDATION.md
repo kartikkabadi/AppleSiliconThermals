@@ -18,6 +18,20 @@
 - Permission probes are individually bounded at 0.6 seconds; four probes plus
   the 1.5-second status read remain within the widget's 5-second read deadline.
   Mutation deadlines are unchanged.
+- Production commit `0bd502e` passed GitHub Actions on both Ubuntu targets:
+  https://github.com/kartikkabadi/AppleSiliconThermals/actions/runs/42804058131
+- Installed the new broker/policy and live plugin, restarting the supervisor and
+  shell. Migration reports Linked memory 6241 and Separate memory 2300/2500;
+  the existing schema 3 preference file and generation remain unchanged until
+  the next explicit user setting change.
+- During supervisor startup, one readback briefly observed fan 2 at 2502 instead
+  of requested 6241. Existing recovery paused manual application, retained both
+  profiles, then restored the original 5779/6241 targets after its cooldown.
+  Final status was ready/manual, with both memory capabilities enabled and no
+  pause, preference error or control error. No additional forced retry was run.
+- Actual layout switching and cold-boot restore were tested in isolated hardware
+  fixtures and QML flow tests. The live session was not rebooted or switched
+  away from the user's active Linked/Max preference.
 
 ---
 

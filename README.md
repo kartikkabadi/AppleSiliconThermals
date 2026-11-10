@@ -11,7 +11,8 @@ unbounded manual override with validated JSON and supervised fan control.
 Version 2.5 remembers both your Linked speed and your Separate fan speeds.
 Switching layouts restores the settings saved for that layout. Both profiles
 and the active layout survive bar restarts and reboot. Older saved settings
-migrate without losing the active choice.
+migrate without losing the active choice. Version 2.5.1 adds installation-path
+checks, sleep/helper failure recovery, and explicit screen-reader controls.
 
 ## Requirements and support
 
@@ -90,6 +91,12 @@ installing account passwordless access to the bounded broker actions. Other
 local accounts do not receive this permission. Interactive terminals use sudo;
 noninteractive callers first try `sudo -n`, then use `pkexec` only when sudo
 requires authentication. A command that ran and failed is not retried.
+
+Setup and uninstall check root ownership and permissions along every installed
+path before elevation, including physical symlink targets. Unsafe existing paths
+are refused with a diagnostic; existing directory ownership is not silently
+changed. This prevents a writable executable parent from weakening the bounded
+sudo policy.
 
 The installer requires Python, systemd and a regex-capable sudoers parser.
 Installation can fail after creating root files, for example if hardware reset
@@ -185,9 +192,20 @@ fan inventory if you need to replace an obsolete Separate profile.
   crashes or stalls, stop handling attempts firmware control; the restarted
   service then validates and reapplies the saved choice. If the kernel or
   hardware is unresponsive, software recovery cannot guarantee cooling.
-- Sleep inhibits new requests and releases control. Resume marks the system
-  awake and retries any failed automatic reset; the service restores a saved
-  manual preference only after cooling is in a known, eligible state. Internal release, sleep and shutdown never overwrite your choice.
+- Sleep inhibits new requests and releases control. A post-only system-sleep
+  hook records a root-owned wake event without waiting for fan-operation locks
+  held by a frozen user session. The supervisor consumes that event after wake,
+  even if pre-sleep release failed or timed out. Old events cannot clear a later
+  sleep inhibit. Restoration waits for the outer sleep target and any queued job
+  to finish, including suspend-then-hibernate intermediate wakes. A failure-only
+  service cleanup signal also covers aborted sleep attempts which run no hook.
+  The normal resume action remains as an idempotent fallback.
+  Resume retries any failed automatic reset; the service restores a saved
+  manual preference only after cooling is in a known, eligible state. Internal
+  release, sleep and shutdown never overwrite your choice.
+- If a UI helper cannot start or hangs, child processes are terminated and late
+  results are ignored. A queued Auto request is retained and retried after a
+  successful periodic telemetry read, rather than stalling or retrying in a loop.
 - Explicit user Auto is saved before hardware release. A crash during that
   release therefore cannot resurrect an older manual preference. A numeric
   choice is committed only after successful target application and verification.
@@ -201,8 +219,8 @@ and software recovery are useful protections, not a hardware safety guarantee.
 
 Root paths are fixed. Privileged actions cannot accept alternate sysfs roots or
 executables through arguments/environment. The single-account sudo policy only
-grants bounded user actions; internal `watchdog`, `release`, `sleep` and `resume`
-actions remain root-only. Status reads require no sudo. Older lease-based control
+grants bounded user actions; internal `watchdog`, `release`, `sleep`, `resume`,
+`wake-signal` and `sleep-failed` actions remain root-only. Status reads require no sudo. Older lease-based control
 services must be upgraded before this widget enables numeric manual controls.
 
 ## Settings and accessibility
@@ -212,7 +230,8 @@ Set `"spinIcon": false` in this widget's `bar.layout` entry in
 follows Omarchy's reduce-motion preference. The fan glyph is 4% larger without
 changing the bar slot, and turns at a constant rate instead of changing speed
 with each RPM reading. The popup scrolls to fit smaller
-screens; it supports Escape and focusable controls. Fan cards distinguish
+screens; it supports Escape and focusable controls. Buttons expose names,
+selected states and guarded press actions to assistive technology. Fan cards distinguish
 current RPM from target RPM, while gauges show speed relative to each fan maximum.
 One Auto/Manual selector controls the overall mode. A Linked/Separate selector
 chooses a shared slider or individual fan controls; component details can be expanded when needed. English strings are in
@@ -243,8 +262,8 @@ widget or its broker**:
 ```
 
 This verifies a hardware release, explicitly saves Auto, stops/disables the
-services, verifies Auto again, and removes the root helper, policy, service files
-and saved preference. It refuses to remove the
+services, verifies Auto again, and removes the root helper, policy, service files,
+the post-wake hook, and saved preference. It refuses to remove the
 helper if the release command fails. It does not remove the bar widget itself.
 If Auto fails, retain the helper, inspect the error and restore known-good
 cooling before removing the control mechanism.
@@ -269,14 +288,15 @@ No Python packages or downloaded runtime binaries are needed.
 python3 -m unittest discover -s tests -v
 node --test tests/test_telemetry.cjs
 bash -n helper.sh setup.sh uninstall.sh
-python3 -m py_compile thermal.py system/apple-silicon-fan-control
+sh -n system/apple-silicon-fan-wake
+python3 -m py_compile thermal.py system/apple-silicon-fan-control system/install-path-safety.py
 ```
 
 Python tests use isolated temporary sysfs/runtime fixtures and do not require
 root or write host fan settings. JavaScript tests validate the QML parser,
 malformed data and markup neutralization. CI runs these on Ubuntu 22.04/24.04.
-The same Python command also runs four headless QML integration tests when
-Omarchy UI modules and Quickshell are installed; otherwise those four tests skip.
+The same Python command also runs headless QML integration and rendered-motion
+tests when Omarchy UI modules and Quickshell are installed; otherwise they skip.
 
 See [VALIDATION.md](VALIDATION.md) for completed physical checks on the M1 Pro,
 including maximum writes and watchdog recovery. Earlier lease-expiry checks

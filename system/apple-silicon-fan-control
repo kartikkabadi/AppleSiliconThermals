@@ -14,6 +14,7 @@ import re
 import signal
 import socket
 import stat
+import subprocess
 import sys
 import time
 import uuid
@@ -490,12 +491,71 @@ def save_preference(preference):
     atomic_json(path, preference)
 
 
+def sleep_operation_finished():
+    # Post hooks also run at intermediate RTC wakes. A failed pre unit may
+    # signal while sleep.target is still inactive but has a queued start job.
+    try:
+        result = subprocess.run(
+            ['/usr/bin/systemctl', '--system', '--no-pager', '--no-ask-password',
+             'show', 'sleep.target', '--all', '--property=ActiveState', '--property=Job'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=1,
+            env={'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C',
+                 'SYSTEMD_COLORS': '0', 'SYSTEMD_PAGER': ''})
+        if result.returncode != 0:
+            return False
+        properties = {}
+        for line in result.stdout.strip().splitlines():
+            key, separator, value = line.partition('=')
+            if separator != '=' or key not in ('ActiveState', 'Job') or key in properties:
+                return False
+            properties[key] = value
+        return (set(properties) == {'ActiveState', 'Job'}
+                and properties['ActiveState'] in ('inactive', 'failed')
+                and properties['Job'] == '')
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def signal_wake():
+    # The post-wake hook runs while user.slice is still frozen. It must never
+    # wait for the operation lock, which a frozen sudo process might hold.
+    secure_runtime(create=True)
+    atomic_json(RUNTIME / 'wake.json', {'schema_version': 1, 'boot_id': boot_id(),
+                'generation': uuid.uuid4().hex, 'created_at': clock()})
+
+
+def load_wake():
+    try:
+        event = read_json(RUNTIME / 'wake.json')
+        if (set(event) != {'schema_version', 'boot_id', 'generation', 'created_at'}
+                or type(event['schema_version']) is not int or event['schema_version'] != 1
+                or not isinstance(event['boot_id'], str)
+                or not isinstance(event['generation'], str)
+                or not re.fullmatch(r'[0-9a-f]{32}', event['generation'])
+                or type(event['created_at']) not in (int, float)
+                or not math.isfinite(event['created_at']) or event['created_at'] < 0):
+            raise RuntimeError('Invalid wake notification fields')
+        if event['boot_id'] != boot_id():
+            return None, None
+        if event['created_at'] > clock():
+            # Return the otherwise valid generation so reconciliation can retire
+            # it permanently, rather than accepting it when time catches up.
+            return event, 'Wake notification invalid: notification is from the future'
+        return event, None
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        return None, 'Wake notification invalid: ' + str(exc)
+
+
 def state_default(error=None):
     return {'schema_version': 1, 'mode': 'unknown', 'owner_uid': None,
             'expires_at': 0, 'boot_id': boot_id(), 'generation': uuid.uuid4().hex,
             'targets': [], 'inhibited': False, 'error': error, 'repairs': [],
             'recovering': False, 'requested_rpm': None, 'requested_fans': [], 'control_mode': 'auto', 'retry_at': 0,
-            'thermal_paused': False, 'restore_blocked_generation': None, 'restore_blocked_reason': None}
+            'thermal_paused': False, 'restore_blocked_generation': None, 'restore_blocked_reason': None,
+            'wake_generation': None, 'sleep_started_at': 0}
 
 
 def load_state():
@@ -522,12 +582,16 @@ def load_state():
         thermal_paused = state.setdefault('thermal_paused', False)
         blocked_generation = state.setdefault('restore_blocked_generation', None)
         blocked_reason = state.setdefault('restore_blocked_reason', None)
+        wake_generation = state.setdefault('wake_generation', None)
+        sleep_started_at = state.setdefault('sleep_started_at', 0)
         if (state.get('schema_version') != 1 or mode not in ('auto', 'manual', 'unknown')
                 or type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry < 0
                 or (owner is not None and (type(owner) is not int or owner < 0))
                 or not re.fullmatch(r'[0-9a-f]{32}', str(state.get('generation', '')))
                 or type(state.get('inhibited')) is not bool or type(recovering) is not bool
                 or type(thermal_paused) is not bool
+                or (wake_generation is not None and (not isinstance(wake_generation, str) or not re.fullmatch(r'[0-9a-f]{32}', wake_generation)))
+                or type(sleep_started_at) not in (int, float) or not math.isfinite(sleep_started_at) or sleep_started_at < 0
                 or (blocked_generation is not None and (not isinstance(blocked_generation, str) or not re.fullmatch(r'[0-9a-f]{32}', blocked_generation)))
                 or (blocked_reason is not None and not isinstance(blocked_reason, str))
                 or type(retry_at) not in (int, float) or not math.isfinite(retry_at) or retry_at < 0
@@ -597,7 +661,8 @@ def reset(reason=None, retry_delay=0, thermal_paused=False, clear_block=False):
     inhibited = previous.get('inhibited', False)
     state = state_default()
     state.update(inhibited=inhibited, retry_at=clock() + retry_delay if retry_delay else 0,
-                 thermal_paused=thermal_paused)
+                 thermal_paused=thermal_paused, wake_generation=previous.get('wake_generation'),
+                 sleep_started_at=previous.get('sleep_started_at', 0))
     if not clear_block:
         state['restore_blocked_generation'] = previous.get('restore_blocked_generation')
         state['restore_blocked_reason'] = previous.get('restore_blocked_reason')
@@ -644,7 +709,9 @@ def apply_manual(preference, persist=False):
     if persist:
         state['restore_blocked_generation'] = previous.get('restore_blocked_generation')
         state['restore_blocked_reason'] = previous.get('restore_blocked_reason')
-    state.update(owner_uid=preference['owner_uid'], generation=preference['generation'],
+    state.update(wake_generation=previous.get('wake_generation'),
+                 sleep_started_at=previous.get('sleep_started_at', 0),
+                 owner_uid=preference['owner_uid'], generation=preference['generation'],
                  requested_rpm=preference['rpm'], requested_fans=preference['fans'],
                  control_mode=preference['control_mode'], recovering=True)
     save(state)
@@ -672,13 +739,31 @@ def apply_manual(preference, persist=False):
 
 
 def command(action, generation=None, fan_index=None, fan_rpm=None):
+    if action in ('wake-signal', 'sleep-failed'):
+        failed = bool(os.environ.get('SERVICE_RESULT')) and os.environ['SERVICE_RESULT'] != 'success'
+        if action == 'wake-signal' or failed:
+            signal_wake()
+            return True
+        return False
     with locked():
         if action in ('sleep', 'resume'):
             state = load_state()
-            # Resume is the explicit awake signal. A failed physical reset keeps
-            # mode unknown and schedules retries, but must not leave an eternal
-            # sleep inhibit after the system has actually resumed.
+            event, event_error = load_wake()
+            if action == 'resume' and event_error:
+                # An explicit administrative resume may repair damaged wake
+                # metadata. Public sudoers actions cannot invoke this path.
+                signal_wake()
+                event, event_error = load_wake()
+            if (action == 'resume' and event is not None
+                    and event['generation'] == state['wake_generation']
+                    and not state['inhibited'] and state['mode'] in ('auto', 'manual')):
+                return  # The post-wake event already performed recovery.
             state['inhibited'] = action == 'sleep'
+            state['sleep_started_at'] = clock() if action == 'sleep' else 0
+            if event is not None:
+                # Retire old notifications before a new sleep. They must never
+                # clear an inhibit belonging to a later sleep attempt.
+                state['wake_generation'] = event['generation']
             save(state)
             if not reset('Manual setting paused for sleep' if action == 'sleep' else None):
                 raise RuntimeError(load_state()['error'])
@@ -717,6 +802,9 @@ def command(action, generation=None, fan_index=None, fan_rpm=None):
             if not restored:
                 raise RuntimeError(load_state()['error'])
             return
+        _, wake_error = load_wake()
+        if wake_error:
+            raise RuntimeError(wake_error)
         if not watchdog_ready():
             raise RuntimeError('Fan watchdog is not running; manual control refused')
         uid = owner_uid()
@@ -777,6 +865,38 @@ def command(action, generation=None, fan_index=None, fan_rpm=None):
 def reconcile():
     preference, preference_error = load_preference()
     state = load_state()
+    event, wake_error = load_wake()
+    if wake_error:
+        if event is not None and event['generation'] != state['wake_generation']:
+            state['wake_generation'] = event['generation']
+            save(state)
+        if state['mode'] == 'unknown' and clock() < state['retry_at']:
+            return
+        if state['mode'] != 'auto' or state.get('error') != wake_error:
+            reset(wake_error, retry_delay=RETRY_SECONDS)
+        return
+    if event is not None and event['generation'] != state['wake_generation']:
+        if state['inhibited'] and event['created_at'] <= state['sleep_started_at']:
+            state['wake_generation'] = event['generation']
+            save(state)  # A stale post from an older sleep is retired only.
+        else:
+            if not sleep_operation_finished():
+                # Keep the notification pending across intermediate RTC wakes,
+                # ongoing stop jobs, or an unavailable system manager. A pre
+                # timeout may have happened before its inhibit was journaled.
+                if not state['inhibited']:
+                    state['inhibited'] = True
+                    save(state)
+                if state['mode'] != 'auto' and clock() >= state['retry_at']:
+                    reset('Waiting for the outer sleep operation to finish', retry_delay=RETRY_SECONDS)
+                return
+            state.update(inhibited=False, sleep_started_at=0, mode='unknown', recovering=True,
+                         wake_generation=event['generation'])
+            save(state)
+            if not reset():
+                return
+        state = load_state()
+
     if preference_error:
         if state['mode'] == 'unknown' and clock() < state['retry_at']:
             return
@@ -924,7 +1044,7 @@ def main():
         if len(sys.argv) != 3 or not re.fullmatch(r'[0-9a-f]{32}', sys.argv[2]):
             raise RuntimeError('Heartbeat requires the current 32-character lease generation')
         generation = sys.argv[2]
-    elif len(sys.argv) != 2 or not re.fullmatch(r'auto|linked|separate|release|status|watchdog|sleep|resume|[1-7][0-9]{3}', action):
+    elif len(sys.argv) != 2 or not re.fullmatch(r'auto|linked|separate|release|status|watchdog|sleep|resume|wake-signal|sleep-failed|[1-7][0-9]{3}', action):
         raise RuntimeError('Invalid fan broker action')
     if action == 'status':
         print(json.dumps(status(), allow_nan=False, separators=(',', ':')))
@@ -934,8 +1054,9 @@ def main():
     if action == 'watchdog':
         watchdog()
     else:
-        command(action, generation, fan_index, fan_rpm)
-        print(json.dumps(status(), allow_nan=False, separators=(',', ':')))
+        outcome = command(action, generation, fan_index, fan_rpm)
+        result = {'wake_signalled': bool(outcome)} if action in ('wake-signal', 'sleep-failed') else status()
+        print(json.dumps(result, allow_nan=False, separators=(',', ':')))
 
 
 if __name__ == '__main__':

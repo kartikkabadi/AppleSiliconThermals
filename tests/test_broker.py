@@ -17,6 +17,7 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 broker = importlib.util.module_from_spec(spec)
 loader.exec_module(broker)
 PRODUCTION_ENABLE = broker.Hardware.enable
+PRODUCTION_SLEEP_FINISHED = broker.sleep_operation_finished
 
 
 class Fixture(unittest.TestCase):
@@ -47,6 +48,7 @@ class Fixture(unittest.TestCase):
         self._patch('PERSISTENCE', self.persistence)
         self._patch('secure_persistence', lambda create=False: None)
         self._patch('clock', lambda: self.now)
+        self._patch('sleep_operation_finished', lambda: True)
         self._patch('time', types.SimpleNamespace(sleep=lambda seconds: None))
         self._patch('boot_id', lambda: 'fixture-boot')
         self._patch('secure_runtime', lambda create=False: None)
@@ -958,6 +960,204 @@ class Fixture(unittest.TestCase):
         self.assertEqual(broker.status()['control_mode'], 'shared')
 
 
+    def test_post_wake_signal_restores_manual_after_failed_pre_sleep_start(self):
+        broker.command('4000')
+        evidence = (self.persistence / 'preference.json').read_bytes()
+        with mock.patch.object(broker.Hardware, 'automatic', side_effect=OSError('transient pre-sleep failure')):
+            with self.assertRaises(RuntimeError):
+                broker.command('sleep')
+        self.assertTrue(broker.status()['inhibited'])
+        # The failed oneshot never runs ExecStop=resume. The independent post
+        # hook still delivers a notification after the actual wake.
+        self.now += 1
+        broker.command('wake-signal')
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertFalse(broker.status()['inhibited'])
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+
+    def test_post_wake_signal_recovers_a_killed_or_timed_out_pre_sleep_process(self):
+        broker.command('4000')
+        with mock.patch.object(broker.Hardware, 'automatic', side_effect=SystemExit('simulated unit timeout/SIGKILL')):
+            with self.assertRaises(SystemExit):
+                broker.command('sleep')
+        self.assertEqual(broker.status()['mode'], 'unknown')
+        self.assertTrue(broker.status()['inhibited'])
+        self.now += 1
+        broker.command('wake-signal')
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertFalse(broker.status()['inhibited'])
+
+    def test_wake_event_is_idempotent_through_manual_restore_and_resume_fallback(self):
+        broker.command('4000')
+        broker.command('sleep')
+        self.now += 1
+        broker.command('wake-signal')
+        broker.watchdog_tick()
+        generation = broker.status()['wake_generation']
+        self.writes.clear()
+        broker.command('resume')  # Successful-start unit fallback after the hook.
+        broker.watchdog_tick()
+        self.assertEqual(self.writes, [])
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        self.assertEqual(broker.status()['wake_generation'], generation)
+        self.writes.clear()
+        broker.watchdog_tick()
+        self.assertEqual(self.writes, [])
+
+    def test_pending_post_wake_event_survives_supervisor_restart(self):
+        broker.command('4000')
+        broker.command('sleep')
+        self.now += 1
+        broker.command('wake-signal')
+        broker.reset()  # New supervisor's initialization while inhibit is set.
+        self.assertTrue(broker.status()['inhibited'])
+        broker.watchdog_tick()
+        self.assertFalse(broker.status()['inhibited'])
+        self.assertEqual(broker.status()['mode'], 'manual')
+
+    def test_older_post_event_cannot_clear_a_newer_sleep_inhibit(self):
+        broker.command('4000')
+        self.now += 1
+        broker.command('wake-signal')
+        self.now += 1
+        broker.command('sleep')
+        broker.watchdog_tick()
+        self.assertTrue(broker.status()['inhibited'])
+        # An older post can finish its atomic write after the newer pre began.
+        broker.atomic_json(self.runtime / 'wake.json', {'schema_version': 1, 'boot_id': 'fixture-boot',
+                           'generation': 'b' * 32, 'created_at': self.now - 1})
+        before = list(self.writes)
+        broker.watchdog_tick()
+        self.assertTrue(broker.status()['inhibited'])
+        self.assertEqual(self.writes, before)
+        self.now += 1
+        broker.command('wake-signal')
+        broker.watchdog_tick()
+        self.assertFalse(broker.status()['inhibited'])
+        self.assertEqual(broker.status()['mode'], 'manual')
+
+    def test_future_wake_event_is_retired_even_after_time_catches_up(self):
+        broker.command('4000')
+        broker.command('sleep')
+        broker.atomic_json(self.runtime / 'wake.json', {'schema_version': 1, 'boot_id': 'fixture-boot',
+                           'generation': 'c' * 32, 'created_at': self.now + 10})
+        broker.watchdog_tick()
+        self.assertTrue(broker.status()['inhibited'])
+        self.assertEqual(broker.status()['wake_generation'], 'c' * 32)
+        self.assertIn('future', broker.status()['error'])
+        self.now += 31
+        broker.watchdog_tick()
+        self.assertTrue(broker.status()['inhibited'])
+        self.assertFalse(broker.status()['ready'])
+        self.now += 1
+        broker.command('wake-signal')
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+
+    def test_malformed_wake_event_stays_fail_closed_without_erasing_intent(self):
+        broker.command('4000')
+        evidence = (self.persistence / 'preference.json').read_bytes()
+        broker.command('sleep')
+        (self.runtime / 'wake.json').write_text('{"generation":false}')
+        broker.watchdog_tick()
+        self.assertTrue(broker.status()['inhibited'])
+        self.assertIn('Wake notification invalid', broker.status()['error'])
+        with self.assertRaisesRegex(RuntimeError, 'Wake notification invalid'):
+            broker.command('4000')
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+        broker.command('resume')  # Explicit root recovery repairs invalid metadata.
+        broker.watchdog_tick()
+        self.assertFalse(broker.status()['inhibited'])
+        self.assertEqual(broker.status()['mode'], 'manual')
+
+    def test_old_boot_wake_event_is_ignored(self):
+        broker.command('4000')
+        broker.command('sleep')
+        broker.atomic_json(self.runtime / 'wake.json', {'schema_version': 1, 'boot_id': 'previous-boot',
+                           'generation': 'd' * 32, 'created_at': self.now + 1000})
+        before = list(self.writes)
+        broker.watchdog_tick()
+        self.assertTrue(broker.status()['inhibited'])
+        self.assertIsNone(broker.status()['wake_generation'])
+        self.assertEqual(self.writes, before)
+
+    def test_interrupted_wake_consumption_journals_unknown_and_recovers_once(self):
+        broker.command('4000')
+        broker.command('sleep')
+        self.now += 1
+        broker.command('wake-signal')
+        with mock.patch.object(broker, 'reset', side_effect=SystemExit('interrupted after wake journal')):
+            with self.assertRaises(SystemExit):
+                broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'unknown')
+        self.assertFalse(broker.status()['inhibited'])
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.writes.clear()
+        broker.watchdog_tick()
+        self.assertEqual(self.writes, [])
+
+    def test_intermediate_compound_sleep_post_waits_for_outer_target_end(self):
+        broker.command('4000')
+        broker.command('sleep')
+        self.now += 1
+        broker.command('wake-signal')  # RTC wake before a secondary hibernate.
+        marker_generation = broker.load_wake()[0]['generation']
+        with mock.patch.object(broker, 'sleep_operation_finished', return_value=False):
+            broker.watchdog_tick()
+            self.assertTrue(broker.status()['inhibited'])
+            self.assertEqual(broker.status()['mode'], 'auto')
+            self.assertNotEqual(broker.status()['wake_generation'], marker_generation)
+            before = list(self.writes)
+            self.now += 10
+            broker.watchdog_tick()
+            self.assertEqual(self.writes, before)
+            self.assertTrue(broker.status()['inhibited'])
+        broker.watchdog_tick()  # The full outer sleep operation has now ended.
+        self.assertFalse(broker.status()['inhibited'])
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual(broker.status()['wake_generation'], marker_generation)
+
+    def test_outer_sleep_gate_inhibits_even_if_pre_timeout_preceded_journaling(self):
+        broker.command('4000')
+        # The pre command timed out waiting for an operation lock and never
+        # wrote an inhibit; the independent post notification still must wait.
+        self.now += 1
+        broker.command('wake-signal')
+        with mock.patch.object(broker, 'sleep_operation_finished', return_value=False):
+            broker.watchdog_tick()
+        self.assertTrue(broker.status()['inhibited'])
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertEqual(broker.status()['sleep_started_at'], 0)
+        broker.watchdog_tick()
+        self.assertFalse(broker.status()['inhibited'])
+        self.assertEqual(broker.status()['mode'], 'manual')
+
+    def test_failed_pre_signal_waits_for_queued_outer_sleep_then_recovers_aborted_attempt(self):
+        broker.command('4000')
+        with mock.patch.object(broker.Hardware, 'automatic', side_effect=OSError('pre-release failed')):
+            with self.assertRaises(RuntimeError):
+                broker.command('sleep')
+        self.now += 1
+        with mock.patch.dict(os.environ, {'SERVICE_RESULT': 'exit-code'}):
+            broker.command('sleep-failed')  # ExecStopPost before queued target starts.
+        generation = broker.load_wake()[0]['generation']
+        # Use the actual manager-query function with a fake response; the
+        # fixture's default gate otherwise assumes a completed outer operation.
+        with mock.patch.object(broker, 'sleep_operation_finished', PRODUCTION_SLEEP_FINISHED), mock.patch.object(broker.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout='ActiveState=inactive\nJob=123 start\n')):
+            broker.watchdog_tick()
+            self.assertTrue(broker.status()['inhibited'])
+            self.assertNotEqual(broker.status()['wake_generation'], generation)
+        # Unsupported sleep aborts before all system-sleep hooks. No post marker
+        # follows; the failure notification alone must resume after the job ends.
+        broker.watchdog_tick()
+        self.assertFalse(broker.status()['inhibited'])
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual(broker.status()['wake_generation'], generation)
+
+
 
 
 class Security(unittest.TestCase):
@@ -1004,6 +1204,64 @@ class Security(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     broker.main()
                 hardware.assert_not_called()
+
+    def test_wake_signal_is_root_only_and_does_not_read_status_or_hardware(self):
+        with mock.patch.object(broker.sys, 'argv', ['broker', 'wake-signal']), mock.patch.object(broker.os, 'geteuid', return_value=1000), mock.patch.object(broker, 'signal_wake') as wake:
+            with self.assertRaisesRegex(RuntimeError, 'require'):
+                broker.main()
+            wake.assert_not_called()
+        with mock.patch.object(broker.sys, 'argv', ['broker', 'wake-signal']), mock.patch.object(broker.os, 'geteuid', return_value=0), mock.patch.object(broker, 'signal_wake') as wake, mock.patch.object(broker, 'locked', side_effect=AssertionError('wake signal must not lock')), mock.patch.object(broker, 'status', side_effect=AssertionError('post hook must not read status')), contextlib.redirect_stdout(__import__('io').StringIO()):
+            broker.main()
+            wake.assert_called_once()
+
+    def test_post_hook_dispatches_only_fixed_wake_signal(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            record = directory / 'record'
+            fake = directory / 'fake-broker'
+            fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> "' + str(record) + '"\n')
+            fake.chmod(0o755)
+            hook = directory / 'hook'
+            source = (SOURCE.parent / 'apple-silicon-fan-wake').read_text()
+            hook.write_text(source.replace('/usr/local/libexec/apple-silicon-fan-control', str(fake)))
+            hook.chmod(0o755)
+            self.assertEqual(subprocess.run([str(hook), 'pre', 'suspend'], check=False).returncode, 0)
+            self.assertFalse(record.exists())
+            self.assertEqual(subprocess.run([str(hook), 'post', 'suspend'], check=False).returncode, 0)
+            self.assertEqual(record.read_text().splitlines(), ['wake-signal'])
+            self.assertEqual(subprocess.run([str(hook), 'post'], check=False).returncode, 64)
+
+    def test_sleep_target_query_is_bounded_fixed_and_fail_closed(self):
+        cases = (('ActiveState=inactive\nJob=\n', True), ('Job=\nActiveState=failed\n', True),
+                 ('ActiveState=active\nJob=\n', False), ('ActiveState=activating\nJob=123\n', False),
+                 ('ActiveState=deactivating\nJob=123\n', False), ('ActiveState=inactive\nJob=123 start\n', False),
+                 ('ActiveState=inactive\n', False), ('ActiveState=unknown\nJob=\n', False),
+                 ('ActiveState=inactive\nJob=\nJob=123\n', False))
+        for value, expected in cases:
+            with self.subTest(value=value), mock.patch.object(broker.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=value)) as run:
+                self.assertEqual(broker.sleep_operation_finished(), expected)
+                self.assertEqual(run.call_args.args[0], ['/usr/bin/systemctl', '--system', '--no-pager', '--no-ask-password', 'show', 'sleep.target', '--all', '--property=ActiveState', '--property=Job'])
+                self.assertEqual(run.call_args.kwargs['timeout'], 1)
+        for failure in (OSError('manager unavailable'), broker.subprocess.TimeoutExpired('systemctl', 1)):
+            with self.subTest(failure=failure), mock.patch.object(broker.subprocess, 'run', side_effect=failure):
+                self.assertFalse(broker.sleep_operation_finished())
+        with mock.patch.object(broker.subprocess, 'run', return_value=types.SimpleNamespace(returncode=1, stdout='ActiveState=inactive\nJob=')):
+            self.assertFalse(broker.sleep_operation_finished())
+
+    def test_failed_sleep_producer_is_root_only_nonlocking_and_suppressed_on_success(self):
+        for service_result in ('exit-code', 'timeout', 'signal', 'resources'):
+            with self.subTest(result=service_result), mock.patch.dict(os.environ, {'SERVICE_RESULT': service_result}), mock.patch.object(broker, 'signal_wake') as wake, mock.patch.object(broker, 'locked', side_effect=AssertionError('failure notification must not lock')):
+                self.assertTrue(broker.command('sleep-failed'))
+                wake.assert_called_once()
+        for environment in ({'SERVICE_RESULT': 'success'}, {}):
+            with self.subTest(environment=environment), mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(broker, 'signal_wake') as wake:
+                self.assertFalse(broker.command('sleep-failed'))
+                wake.assert_not_called()
+        with mock.patch.object(broker.sys, 'argv', ['broker', 'sleep-failed']), mock.patch.object(broker.os, 'geteuid', return_value=1000), mock.patch.object(broker, 'signal_wake') as wake:
+            with self.assertRaisesRegex(RuntimeError, 'require'):
+                broker.main()
+            wake.assert_not_called()
 
     def test_extra_argument_rejected(self):
         with mock.patch.object(broker.sys, 'argv', ['broker', 'auto', 'extra']):

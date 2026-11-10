@@ -27,6 +27,10 @@ if [[ ! -d /run/systemd/system ]]; then
   exit 1
 fi
 
+# Existing parent directories are not repaired by `install -D`. Check the whole
+# privilege boundary before any elevation, including every symlink target hop.
+/usr/bin/python3 -I "$source_dir/system/install-path-safety.py"
+
 # sudo -n first; only an authentication failure is eligible for desktop auth.
 # Failures from a command that actually ran must never be executed a second time.
 elevate() {
@@ -98,6 +102,9 @@ elevate /usr/bin/install -o root -g root -m 644 -D "$source_dir/system/apple-sil
 # Otherwise a previously loaded ExecStopPost=auto could erase saved intent.
 elevate /usr/bin/systemctl daemon-reload
 elevate /usr/bin/install -o root -g root -m 755 -D "$source_dir/system/apple-silicon-fan-control" /usr/local/libexec/apple-silicon-fan-control
+# The post-sleep hook calls wake-signal, so publish it only after the executable
+# understands that action. The sleep unit retains its compatible resume fallback.
+elevate /usr/bin/install -o root -g root -m 755 -D "$source_dir/system/apple-silicon-fan-wake" /usr/lib/systemd/system-sleep/apple-silicon-fan-control
 # Start the independent safety service before reporting setup success.
 elevate /usr/bin/systemctl enable apple-silicon-fan-watchdog.service apple-silicon-fan-sleep.service
 elevate /usr/bin/systemctl restart apple-silicon-fan-watchdog.service

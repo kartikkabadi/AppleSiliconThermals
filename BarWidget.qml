@@ -34,7 +34,10 @@ BarWidget {
     property string controlNotice: ""
     property string warningText: ""
     property bool writeBusy: false
+    property int writeSequence: 0
+    property bool autoRetryNeedsRead: false
     property bool readBusy: false
+    property int readSequence: 0
     property var pendingRequests: []
     property bool persistentControl: false
     property string savedMode: "unknown"
@@ -154,12 +157,14 @@ BarWidget {
             invalidate(strings.t("readFailed"))
         }
     }
-    function refresh() {
+    function refresh(allowAutoRetry) {
         if (readBusy || writeBusy) return
         readBusy = true
+        readProc.sequence = ++readSequence
         readProc.buffer = ""
         readProc.failed = false
         readProc.cancelled = false
+        readProc.allowAutoRetry = allowAutoRetry === true
         readProc.running = true
         readDeadline.restart()
     }
@@ -277,6 +282,7 @@ BarWidget {
         if (!/^(auto|[1-7][0-9]{3})$/.test(value)) return
         if (value === "auto") {
             if (!controlAvailable) return
+            autoRetryNeedsRead = false
             manualControlChoice = ""
             enqueue({kind:"auto",key:"auto",args:["set", "auto"]})
         } else {
@@ -304,6 +310,20 @@ BarWidget {
     function retainAutoRecovery() {
         pendingRequests = pendingRequests.filter(function(request) { return request.kind === "auto" })
     }
+    function finishWriteFailure(sequence, request, message) {
+        if (sequence !== writeSequence || !writeBusy) return
+        manualControlChoice = ""
+        controlError = message
+        retainAutoRecovery()
+        if (request && request.kind === "auto" && pendingRequests.length === 0) pendingRequests = [request]
+        // Preserve firmware-recovery intent, but retry only on a subsequent
+        // successful periodic read. A failing command must not form a busy loop.
+        autoRetryNeedsRead = pendingRequests.some(function(pending) { return pending.kind === "auto" })
+        writeBusy = false
+        // A failed executable cannot supply status either; leave that retry to
+        // the normal poll rather than immediately starting another dead read.
+        if (writeProc.didStart) refresh()
+    }
     function startPending() {
         if (writeBusy || pendingRequests.length === 0) return
         if (!dataValid || !fanControlEnabled || !perFanControl) {
@@ -311,31 +331,34 @@ BarWidget {
             manualControlChoice = ""
         }
         if (pendingRequests.length === 0) return
+        if (pendingRequests[0].kind === "auto" && autoRetryNeedsRead) return
         writeBusy = true
+        writeProc.sequence = ++writeSequence
         if (readBusy) readProc.cancelled = true
-        if (readProc.running) readProc.running = false
+        if (readProc.running) readProc.signal(9)
         var queue = pendingRequests.slice()
         writeProc.activeRequest = queue.shift()
         pendingRequests = queue
         writeProc.buffer = ""
         writeProc.output = ""
         writeProc.timedOut = false
+        writeProc.didStart = false
         controlError = ""
         writeProc.running = true
         writeDeadline.restart()
     }
     Component.onCompleted: refresh()
 
-    Timer { interval: root.popupOpen ? 1500 : 3000; running: true; repeat: true; onTriggered: root.refresh() }
+    Timer { interval: root.popupOpen ? 1500 : 3000; running: true; repeat: true; onTriggered: root.refresh(true) }
     Timer { id: freshness; interval: 10000; onTriggered: root.invalidate(strings.t("stale")) }
     Timer {
         id: readDeadline
         interval: 5000
         onTriggered: {
             readProc.failed = true
-            readProc.running = false
             root.invalidate(strings.t("readTimeout"))
-            if (!readProc.running) root.readBusy = false
+            if (readProc.running) readProc.signal(9)
+            else root.readBusy = false
         }
     }
     Process {
@@ -343,6 +366,8 @@ BarWidget {
         property string buffer: ""
         property bool failed: false
         property bool cancelled: false
+        property bool allowAutoRetry: false
+        property int sequence: 0
         command: [root.helperPath, "get"]
         stdout: SplitParser {
             onRead: function(line) {
@@ -352,13 +377,19 @@ BarWidget {
         }
         onExited: function(code) {
             readDeadline.stop()
+            var sequence = readProc.sequence
             Qt.callLater(function() {
+                if (sequence !== root.readSequence || !root.readBusy) return
                 if (readProc.cancelled) { root.readBusy = false; return }
                 if (!readProc.failed) {
                     if (code !== 0 && readProc.buffer.trim() === "") root.invalidate(strings.t("readFailed"))
                     else root.applyData(readProc.buffer)
                 } else if (root.readError === "") root.invalidate(strings.t("readFailed"))
                 root.readBusy = false
+                if (readProc.allowAutoRetry && root.dataValid && root.controlAvailable && root.autoRetryNeedsRead) {
+                    root.autoRetryNeedsRead = false
+                    root.startPending()
+                }
             })
         }
     }
@@ -367,11 +398,11 @@ BarWidget {
         interval: 5000
         onTriggered: {
             writeProc.timedOut = true
-            writeProc.running = false
             root.controlError = strings.t("writeTimeout")
             root.manualControlChoice = ""
             root.retainAutoRecovery()
-            if (!writeProc.running) root.writeBusy = false
+            if (writeProc.running) writeProc.signal(9)
+            else root.finishWriteFailure(writeProc.sequence, writeProc.activeRequest, strings.t("writeTimeout"))
         }
     }
     Process {
@@ -380,20 +411,27 @@ BarWidget {
         property string buffer: ""
         property string output: ""
         property bool timedOut: false
+        property bool didStart: false
+        property int sequence: 0
+        onStarted: didStart = true
         command: activeRequest ? [root.helperPath].concat(activeRequest.args) : []
         stdout: SplitParser { onRead: function(line) { if (writeProc.output.length < 16384) writeProc.output += line + "\n" } }
         stderr: SplitParser { onRead: function(line) { if (writeProc.buffer.length < 1024) writeProc.buffer += line.slice(0, 240) + "\n" } }
         onExited: function(code) {
             writeDeadline.stop()
+            var sequence = writeProc.sequence
+            var request = writeProc.activeRequest
             Qt.callLater(function() {
+                if (sequence !== root.writeSequence || !root.writeBusy) return
                 if (code !== 0 || writeProc.timedOut) {
-                    root.manualControlChoice = ""
+                    var message = strings.t("writeTimeout")
                     if (!writeProc.timedOut) {
                         var detail = writeProc.buffer.trim()
                         try { detail = JSON.parse(writeProc.output).error || detail } catch (error) {}
-                        root.controlError = Telemetry.boundedText(detail, 240) || strings.t("writeFailed")
+                        message = Telemetry.boundedText(detail, 240) || strings.t("writeFailed")
                     }
-                    root.retainAutoRecovery()
+                    root.finishWriteFailure(sequence, request, message)
+                    return
                 } else {
                     try {
                         var reply = JSON.parse(writeProc.output)
@@ -403,7 +441,6 @@ BarWidget {
                             separate_memory:reply.separate_memory,saved_separate_fans:reply.saved_separate_fans,
                             linked_memory:reply.linked_memory,saved_linked_rpm:reply.saved_linked_rpm}))
                         if (writeProc.activeRequest.kind !== "auto" && (reply.persistent !== true || !checked.preferenceValid)) throw new Error("Invalid saved fan targets")
-                        var request = writeProc.activeRequest
                         if (request.kind === "fan" && (checked.savedControlMode !== "individual" || !checked.savedFans.some(function(fan) { return fan.index === Number(request.args[1]) && fan.rpm === Number(request.args[2]) }))) throw new Error("Fan target was not acknowledged")
                         if (request.kind === "shared" && (checked.savedControlMode !== "shared" || checked.savedRpm !== Number(request.args[1]))) throw new Error("Shared target was not acknowledged")
                         if (request.kind === "separate" && (!checked.separateMemory || checked.savedControlMode !== "individual" || !checked.separateMemoryValid)) throw new Error("Remembered separate profile was not acknowledged")
@@ -423,9 +460,8 @@ BarWidget {
                             root.savedLinkedRpm = checked.savedLinkedRpm
                         } else root.savedPreferenceValid = false // Auto recovery works with older brokers too.
                     } catch (error) {
-                        root.manualControlChoice = ""
-                        root.controlError = strings.t("writeFailed")
-                        root.retainAutoRecovery()
+                        root.finishWriteFailure(sequence, request, strings.t("writeFailed"))
+                        return
                     }
                 }
                 root.writeBusy = false
@@ -439,6 +475,17 @@ BarWidget {
     implicitHeight: button.implicitHeight
     BarIconButton {
         id: button
+        objectName: "thermals-bar-button"
+        activeFocusOnTab: true
+        Accessible.role: Accessible.Button
+        Accessible.focusable: true
+        Accessible.name: strings.t("title")
+        Accessible.checkable: true
+        Accessible.checked: root.popupOpen
+        Accessible.onPressAction: if (enabled && visible) root.togglePopup()
+        Keys.onReturnPressed: root.togglePopup()
+        Keys.onEnterPressed: root.togglePopup()
+        Keys.onSpacePressed: root.togglePopup()
         anchors.fill: parent
         bar: root.bar
         slotSize: Style.bar.statusSlot
@@ -503,8 +550,8 @@ BarWidget {
                         Row {
                             id: headerActions
                             spacing: Style.space(2)
-                            Button { text: "󰑐"; fontSize: Style.font.body; horizontalPadding: Style.space(7); tooltipText: strings.t("refresh"); Accessible.name: strings.t("refresh"); focusable: true; enabled: !root.readBusy; onClicked: root.refresh() }
-                            Button { text: "×"; fontSize: Style.font.body; horizontalPadding: Style.space(7); tooltipText: strings.t("close"); Accessible.name: strings.t("close"); focusable: true; onClicked: root.close() }
+                            AccessibleButton { objectName: "refresh-thermals"; text: "󰑐"; fontSize: Style.font.body; horizontalPadding: Style.space(7); tooltipText: strings.t("refresh"); Accessible.name: strings.t("refresh"); focusable: true; enabled: !root.readBusy; onClicked: root.refresh() }
+                            AccessibleButton { objectName: "close-thermals"; text: "×"; fontSize: Style.font.body; horizontalPadding: Style.space(7); tooltipText: strings.t("close"); Accessible.name: strings.t("close"); focusable: true; onClicked: root.close() }
                         }
                     }
 
@@ -551,8 +598,8 @@ BarWidget {
                                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
                                 anchors.margins: Style.space(4)
                                 spacing: Style.space(4)
-                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("autoButton"); iconText: "󰒓"; focusable: true; enabled: root.controlAvailable; selected: !root.desiredManual && root.mode === "auto"; onClicked: root.setSpeed("auto") }
-                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("manualButton"); iconText: "󰒺"; focusable: true; enabled: root.fanControlEnabled && !root.writeBusy; selected: root.desiredManual; onClicked: root.enableManual() }
+                                AccessibleButton { objectName: "mode-auto"; checkable: true; width: (parent.width - parent.spacing) / 2; text: strings.t("autoButton"); iconText: "󰒓"; focusable: true; enabled: root.controlAvailable; selected: !root.desiredManual && root.mode === "auto"; onClicked: root.setSpeed("auto") }
+                                AccessibleButton { objectName: "mode-manual"; checkable: true; width: (parent.width - parent.spacing) / 2; text: strings.t("manualButton"); iconText: "󰒺"; focusable: true; enabled: root.fanControlEnabled && !root.writeBusy; selected: root.desiredManual; onClicked: root.enableManual() }
                             }
                         }
 
@@ -564,8 +611,8 @@ BarWidget {
                             Row {
                                 width: parent.width
                                 spacing: Style.space(6)
-                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("linked"); iconText: "󰌷"; focusable: true; selected: !root.separateControls; enabled: root.fanControlEnabled; onClicked: root.chooseControlMode("shared") }
-                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("separate"); iconText: "󰕮"; focusable: true; selected: root.separateControls; enabled: root.fanControlEnabled && (!root.separateMemory || root.separateRestoreAvailable); onClicked: root.chooseControlMode("individual") }
+                                AccessibleButton { objectName: "layout-linked"; checkable: true; width: (parent.width - parent.spacing) / 2; text: strings.t("linked"); iconText: "󰌷"; focusable: true; selected: !root.separateControls; enabled: root.fanControlEnabled; onClicked: root.chooseControlMode("shared") }
+                                AccessibleButton { objectName: "layout-separate"; checkable: true; width: (parent.width - parent.spacing) / 2; text: strings.t("separate"); iconText: "󰕮"; focusable: true; selected: root.separateControls; enabled: root.fanControlEnabled && (!root.separateMemory || root.separateRestoreAvailable); onClicked: root.chooseControlMode("individual") }
                             }
                         }
                         LinkedFanControls {
@@ -642,7 +689,7 @@ BarWidget {
                     Column {
                         width: parent.width
                         spacing: Style.space(8)
-                        Button { width: parent.width; text: strings.t("sensorDetails"); iconText: root.detailsOpen ? "󰅃" : "󰅀"; leftAlign: true; focusable: true; selected: root.detailsOpen; onClicked: root.detailsOpen = !root.detailsOpen }
+                        AccessibleButton { objectName: "sensor-details"; checkable: true; width: parent.width; text: strings.t("sensorDetails"); iconText: root.detailsOpen ? "󰅃" : "󰅀"; leftAlign: true; focusable: true; selected: root.detailsOpen; onClicked: root.detailsOpen = !root.detailsOpen }
                         Grid {
                             id: sensorGrid
                             width: parent.width

@@ -100,7 +100,8 @@ BorderSurface {
                 spacing: Style.space(3)
                 Repeater {
                     model: [card.snap(card.maximum * 0.25), card.snap(card.maximum * 0.5), card.maximum]
-                    Button {
+                    AccessibleButton {
+                        checkable: true
                         required property int index
                         required property int modelData
                         width: (parent.width - parent.spacing * 2) / 3

@@ -18,7 +18,8 @@ jobs:
       - name: Validate scripts and compile Python
         run: |
           bash -n helper.sh setup.sh uninstall.sh
-          python3 -m py_compile thermal.py system/apple-silicon-fan-control
+          sh -n system/apple-silicon-fan-wake
+          python3 -m py_compile thermal.py system/apple-silicon-fan-control system/install-path-safety.py
       - name: Test isolated hardware fixtures
         run: python3 -m unittest discover -s tests -v
       - name: Test telemetry validation and markup handling

@@ -1,0 +1,11 @@
+#!/bin/sh
+# systemd invokes post hooks even if the independent pre-sleep unit failed.
+# user.slice remains frozen here: record an event, never wait for fan I/O/locks.
+if [ "$#" -ne 2 ]; then
+  exit 64
+fi
+case "$1" in
+  pre) exit 0 ;;
+  post) exec /usr/local/libexec/apple-silicon-fan-control wake-signal ;;
+  *) exit 64 ;;
+esac

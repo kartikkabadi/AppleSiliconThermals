@@ -23,6 +23,11 @@ if statefile.exists():
     data.update(json.loads(statefile.read_text()))
 action = sys.argv[1]
 if action == 'get':
+    if (root / 'hang-read').exists():
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        (root / 'hang-read-started').write_text('started')
+        time.sleep(8)
     counter_file = root / 'reads.txt'
     count = int(counter_file.read_text()) + 1 if counter_file.exists() else 1
     counter_file.write_text(str(count))
@@ -35,6 +40,10 @@ else:
     with (root / 'actions.log').open('a') as log:
         log.write(' '.join([action, *arguments]) + '\n')
     time.sleep(0.15)
+    if arguments and arguments[-1] == '4300':
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(8)  # A fixture child that must be reaped before queued Auto.
     if arguments and arguments[-1] in ('4999', '5050'):
         print(json.dumps({'error': 'fixture command failure <img src="invalid">'}))
         sys.exit(9)

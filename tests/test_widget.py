@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 
@@ -14,7 +15,7 @@ AVAILABLE = shutil.which('quickshell') and (SHELL / 'Ui/PopupCard.qml').exists()
 
 @unittest.skipUnless(AVAILABLE, 'requires installed Omarchy UI modules and Quickshell')
 class WidgetIntegrationTests(unittest.TestCase):
-    def run_widget(self, script, delayed_helper=False):
+    def run_widget(self, script, delayed_helper=False, helper_gap=False, hanging_read=False):
         with tempfile.TemporaryDirectory(prefix='thermals-qml-') as temporary:
             root = Path(temporary)
             plugin = root / 'Plugin'
@@ -29,16 +30,55 @@ class WidgetIntegrationTests(unittest.TestCase):
             if not delayed_helper:
                 shutil.copy2(REPO / 'tests/qml/helper.py', helper)
                 helper.chmod(0o755)
+            if helper_gap:
+                import json
+                (plugin / 'state.json').write_text(json.dumps({'mode': 'manual', 'saved_mode': 'manual',
+                    'saved_control_mode': 'shared', 'saved_rpm': 3000, 'saved_fans': [], 'saved_linked_rpm': 3000}))
+            if hanging_read:
+                marker = plugin / 'hang-read'
+                marker.touch()
             environment = dict(os.environ, QT_QPA_PLATFORM='offscreen')
             with subprocess.Popen(['quickshell', '-p', str(root / 'shell.qml'), '--no-color'],
                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                   text=True, env=environment) as process:
+                if hanging_read:
+                    # Confirm the first child installed its SIGTERM handler;
+                    # later reads are healthy while that exact child hangs.
+                    started = plugin / 'hang-read-started'
+                    deadline = time.monotonic() + 3
+                    while not started.exists() and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertTrue(started.exists(), 'Hanging-reader fixture did not start')
+                    marker.unlink()
                 if delayed_helper:
                     time.sleep(5.6)
                     shutil.copy2(REPO / 'tests/qml/helper.py', helper)
                     helper.chmod(0o755)
                 try:
-                    output, _ = process.communicate(timeout=12)
+                    if helper_gap:
+                        kill_timer = threading.Timer(12, process.kill)
+                        kill_timer.start()
+                        collected = []
+                        restore_timer = None
+                        try:
+                            for line in process.stdout:
+                                collected.append(line)
+                                if 'READY_REMOVE_HELPER' in line:
+                                    helper.unlink()
+                                elif 'RESTORE_HELPER' in line:
+                                    def restore():
+                                        shutil.copy2(REPO / 'tests/qml/helper.py', helper)
+                                        helper.chmod(0o755)
+                                    restore_timer = threading.Timer(.2, restore)
+                                    restore_timer.start()
+                            process.wait(timeout=1)
+                            output = ''.join(collected)
+                        finally:
+                            kill_timer.cancel()
+                            if restore_timer:
+                                restore_timer.join(timeout=1)
+                    else:
+                        output, _ = process.communicate(timeout=12)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     output, _ = process.communicate()
@@ -78,8 +118,23 @@ class WidgetIntegrationTests(unittest.TestCase):
     def test_missing_executable_recovers_after_install(self):
         self.run_widget('recovery.qml', delayed_helper=True)
 
+    def test_queued_auto_recovers_after_failed_start_and_helper_restoration(self):
+        actions = self.run_widget('auto-recovery.qml', helper_gap=True).splitlines()
+        self.assertEqual(actions, ['set auto'])
+
+    def test_timed_out_child_cannot_block_or_complete_the_later_auto_request(self):
+        actions = self.run_widget('auto-timeout.qml').splitlines()
+        self.assertEqual(actions, ['set 4300', 'set auto'])
+
+    def test_timed_out_reader_is_killed_before_fresh_poll(self):
+        self.run_widget('read-timeout.qml', hanging_read=True)
+
     def test_sensor_refresh_does_not_recreate_interactive_fan_cards(self):
         self.run_widget('stable-cards.qml')
+
+    def test_accessibility_semantics_keyboard_and_real_control_actions(self):
+        actions = self.run_widget('accessibility.qml').splitlines()
+        self.assertEqual(actions, ['set-linked', 'set-separate'])
 
 
 if __name__ == '__main__':

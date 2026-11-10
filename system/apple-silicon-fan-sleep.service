@@ -7,7 +7,10 @@ StopWhenUnneeded=yes
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/libexec/apple-silicon-fan-control sleep
+# Normal successful-start fallback. The post-wake hook also handles failed starts.
 ExecStop=/usr/local/libexec/apple-silicon-fan-control resume
+# Failed/aborted starts may never reach system-sleep hooks or ExecStop.
+ExecStopPost=/usr/local/libexec/apple-silicon-fan-control sleep-failed
 TimeoutStartSec=15
 
 [Install]

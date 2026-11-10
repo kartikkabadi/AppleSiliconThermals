@@ -112,6 +112,46 @@ class OperatingSystemBoundaryTests(unittest.TestCase):
         self.assertEqual(measurements['count'], 8)
         self.assertEqual(measurements['maximum'], 1)
 
+    def test_post_wake_notification_does_not_wait_for_a_frozen_operation_lock(self):
+        import fcntl
+        import json
+        lock = self.directory / 'lock'
+        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        failures = []
+        original_fstat = os.fstat
+        def fixture_root_stat(fd):
+            info = original_fstat(fd)
+            fields = list(info)
+            fields[4] = 0
+            return os.stat_result(fields)
+        def notify():
+            try:
+                broker.command('wake-signal')
+            except Exception as error:
+                failures.append(error)
+        with mock.patch.object(broker, 'RUNTIME', self.directory), \
+                mock.patch.object(broker, 'secure_runtime', lambda create=False: None), \
+                mock.patch.object(broker.os, 'fstat', fixture_root_stat), \
+                mock.patch.object(broker, 'boot_id', return_value='post-wake-boot'), \
+                mock.patch.object(broker, 'clock', return_value=100.0), \
+                mock.patch.object(broker, 'Hardware', side_effect=AssertionError('post hook must not touch hardware')):
+            worker = threading.Thread(target=notify, daemon=True)
+            try:
+                worker.start()
+                worker.join(timeout=1)
+                completed_while_locked = not worker.is_alive()
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+                worker.join(timeout=1)
+        self.assertTrue(completed_while_locked)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(failures, repr(failures))
+        event = json.loads((self.directory / 'wake.json').read_text())
+        self.assertEqual(event['boot_id'], 'post-wake-boot')
+        self.assertEqual(event['created_at'], 100.0)
+
     def test_atomic_preference_write_syncs_file_before_rename_and_directory_after(self):
         destination = self.directory / 'preference.json'
         events = []
@@ -165,6 +205,7 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         for name, value in (
             ('RUNTIME', self.runtime), ('PERSISTENCE', self.persistence),
             ('clock', lambda: self.now), ('boot_id', lambda: self.current_boot),
+            ('sleep_operation_finished', lambda: True),
             ('locked', contextlib.nullcontext), ('Hardware', lambda: self.hardware),
             ('secure_runtime', lambda create=False: None),
             ('secure_persistence', lambda create=False: None),

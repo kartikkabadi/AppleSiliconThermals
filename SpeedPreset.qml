@@ -14,8 +14,9 @@ BorderSurface {
     Accessible.role: Accessible.Button
     Accessible.name: title + ", " + detail
     Accessible.checkable: true
+    Accessible.focusable: true
     Accessible.checked: selected
-    Accessible.onPressAction: if (enabled) clicked()
+    Accessible.onPressAction: if (enabled && visible) clicked()
     implicitHeight: content.implicitHeight + Style.space(18)
     radius: Style.cornerRadius
     opacity: enabled ? 1 : 0.45

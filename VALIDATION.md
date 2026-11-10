@@ -1,3 +1,55 @@
+# Version 2.5.1 final full review — 10 November 2026
+
+Reviewed the broker, telemetry/helper, all QML components, install/remove flows,
+service units, sudo policy, stored profiles, test coverage and CI configuration.
+Checked the live installation without changing the user's chosen RPM profiles.
+
+Findings fixed:
+
+- P1: An existing writable or user-owned install ancestor could let someone
+  replace a root executable covered by the sudo policy. Setup and uninstall now
+  run a shared read-only boundary check before elevation, including logical and
+  physical symlink chains. This host's original paths were already secure.
+- P2: A failed/timed-out pre-sleep service could skip ExecStop and strand the
+  inhibit after wake. A root-only, post-only wake hook records a nonblocking
+  boot-scoped event; the supervisor handles it after wake. Generations and sleep
+  epochs prevent stale notifications from clearing a later inhibit. A separate
+  failure-only service cleanup handles aborted attempts with no sleep hook;
+  restoration requires both an ended sleep target and no queued sleep job.
+  This follows the intermediate-wake behavior in [systemd's sleep implementation](https://github.com/systemd/systemd/blob/v262.1/src/sleep/sleep.c).
+- P2: Missing or unresponsive helpers could strand queued Auto or block future
+  telemetry. Process sequencing, termination and bounded periodic Auto recovery
+  now cover failed starts, hung children and late callbacks.
+- P3: Host button instances lacked names, selected states and activation actions
+  for assistive technology. A local wrapper supplies those semantics; offscreen
+  keyboard and assistive activation tests exercise the actual control handlers.
+
+Validation:
+
+- All 211 Python tests and 34 JavaScript tests pass on the review host. This
+  includes nine UI integration cases, rendered icon motion, 108 broker cases,
+  32 independent integration cases and 16 installer/elevation cases.
+- New regressions reproduce the original installer boundary, missing/hung helper,
+  failed/timed-out/aborted sleep and intermediate-wake bugs. Wake notification
+  was also tested while an actual operation flock was held, without host fan I/O.
+- Real offscreen Return/Space and assistive button presses exercise actual UI
+  handlers. Hidden and disabled activation stays blocked.
+- Shell syntax, Python compilation, manifest validation, sudoers parsing,
+  structural systemd unit checks and diff checks pass. The new path preflight
+  and bounded read-only sleep-target query also pass against this live host.
+- Physical suspend/hibernate/reboot and other Mac models remain untested. Their
+  state transitions have isolated fixture coverage; that is distinct from a
+  physical hardware test. The sensors remain component readings, not CPU/GPU
+  die temperatures. No remaining high-confidence blocker was found in this pass.
+
+The reviewed runtime performs no Internet requests and needs no downloaded
+Python dependencies. The root
+broker uses fixed paths, isolated Python, bounded literal arguments, validated
+JSON and root-owned state. These checks are not a guarantee against every future
+bug, kernel/hardware fault, or overheating failure.
+
+---
+
 # Version 2.5 independent Linked memory — 10 November 2026
 
 - Schema 4 adds a separate remembered Linked RPM. Linked edits update that bank;

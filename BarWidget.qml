@@ -36,12 +36,13 @@ BarWidget {
     property string pendingTarget: ""
     property bool leaseArmed: false
     property string leaseGeneration: ""
+    property bool leaseRecovering: false
     readonly property string helperPath: decodeURIComponent(Qt.resolvedUrl("helper.sh").toString().replace(/^file:\/\//, ""))
     readonly property bool spinIcon: setting("spinIcon", true) === true
     readonly property int quietRpm: snapSpeed(fanMax * 0.25)
     readonly property int regularRpm: snapSpeed(fanMax * 0.5)
     readonly property int maxRpm: fanMax
-    readonly property string modeText: strings.t(mode === "manual" ? "manual" : mode === "auto" ? "auto" : "unknown")
+    readonly property string modeText: strings.t(leaseRecovering ? "recovering" : mode === "manual" ? "manual" : mode === "auto" ? "auto" : "unknown")
     readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
 
     Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
@@ -66,6 +67,7 @@ BarWidget {
         fans = []
         sensors = ({})
         leaseArmed = false
+        leaseRecovering = false
         readError = message
         warningText = ""
     }
@@ -88,6 +90,7 @@ BarWidget {
             fans = data.fans
             hasFan = data.hasFan && fanCount > 0
             mode = data.mode
+            leaseRecovering = data.leaseRecovering
             fanControlEnabled = data.controlEnabled
             sensors = data.sensors
             maxTemp = data.maxTemp
@@ -96,7 +99,11 @@ BarWidget {
             readError = ""
             warningText = data.warnings.join("\n")
             freshness.restart()
-            if (mode !== "manual" || !fanControlEnabled || !data.leaseOwned || data.generation !== leaseGeneration) leaseArmed = false
+            var sameLease = data.leaseOwned && leaseGeneration !== "" && data.generation === leaseGeneration
+            // A journaled, bounded repair temporarily reports unknown mode. Keep
+            // renewing only our already-armed generation while its broker owns
+            // that repair; all other unknown/unavailable states fail closed.
+            if (!sameLease || !((mode === "manual" && fanControlEnabled) || data.leaseRecovering)) leaseArmed = false
         } catch (error) {
             invalidate(strings.t("readFailed"))
         }

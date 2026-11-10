@@ -42,7 +42,8 @@ function parse(raw) {
         controlError: boundedText(data.control_error, 240),
         generation: /^[0-9a-f]{32}$/.test(data.broker_generation) ? data.broker_generation : "",
         leaseOwned: data.lease_owned === true,
+        leaseRecovering: data.lease_recovering === true,
         controlAvailable: data.control_available === true,
-        controlEnabled: !error && completeFans && data.control_available === true && data.has_fan === true && data.fan_control_enabled === true && fans.length > 0 && min !== null && max !== null && min <= max
+        controlEnabled: !error && data.lease_recovering !== true && completeFans && data.control_available === true && data.has_fan === true && data.fan_control_enabled === true && fans.length > 0 && min !== null && max !== null && min <= max
             && fans.every(function(fan) { return fan.min !== null && fan.max !== null && fan.min <= fan.max && fan.min >= 1000 && fan.max <= 7999 })}
 }

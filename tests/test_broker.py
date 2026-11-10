@@ -16,6 +16,7 @@ loader = importlib.machinery.SourceFileLoader('fan_broker', str(SOURCE))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 broker = importlib.util.module_from_spec(spec)
 loader.exec_module(broker)
+PRODUCTION_ENABLE = broker.Hardware.enable
 
 
 class Fixture(unittest.TestCase):
@@ -42,6 +43,7 @@ class Fixture(unittest.TestCase):
         self._patch('SYSFS', self.root / 'sys')
         self._patch('RUNTIME', self.runtime)
         self._patch('clock', lambda: self.now)
+        self._patch('time', types.SimpleNamespace(sleep=lambda seconds: None))
         self._patch('boot_id', lambda: 'fixture-boot')
         self._patch('secure_runtime', lambda create=False: None)
         self._patch('secure_regular', self.open_fixture)
@@ -77,13 +79,13 @@ class Fixture(unittest.TestCase):
     def test_manual_clamps_each_hardware_limit(self):
         with mock.patch.dict(os.environ, {'SUDO_UID': '1000'}):
             broker.command('7999')
-        self.assertEqual(self.writes, [('fan1_target', 5779), ('fan2_target', 6241)])
+        self.assertEqual(self.writes, [('fan1_target', 0), ('fan1_target', 5779), ('fan2_target', 0), ('fan2_target', 6241)])
         state = broker.status()
         self.assertEqual((state['mode'], state['owner_uid'], state['expires_in']), ('manual', 1000, 12))
 
     def test_manual_clamps_below_minimum(self):
         broker.command('1000')
-        self.assertEqual(self.writes, [('fan1_target', 1200), ('fan2_target', 1200)])
+        self.assertEqual(self.writes, [('fan1_target', 0), ('fan1_target', 1200), ('fan2_target', 0), ('fan2_target', 1200)])
 
     def test_auto_primes_max_then_zero_for_every_fan(self):
         broker.command('auto')
@@ -146,6 +148,54 @@ class Fixture(unittest.TestCase):
             with self.assertRaises(OSError):
                 broker.reset()
             automatic.assert_called_once()
+
+    def test_manual_acquisition_refreshes_stale_cached_mode(self):
+        cached = {1: True, 2: True}
+        manual = {1: False, 2: False}
+        def driver_write(hardware, path, value):
+            index = int(path.name[3])
+            if value == 0:
+                if cached[index]:
+                    manual[index] = False
+                    cached[index] = False
+            else:
+                if not cached[index]:
+                    manual[index] = True
+                    cached[index] = True
+                if manual[index]:
+                    path.write_text(str(value))
+        with mock.patch.object(broker.Hardware, 'write', driver_write):
+            broker.command('4000')
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual(manual, {1: True, 2: True})
+        self.assertEqual((self.hw / 'fan1_target').read_text(), '4000')
+
+    def test_initial_manual_target_must_pass_readback(self):
+        original = self.write_fixture
+        def ignored_write(hardware, path, value):
+            if value == 4000:
+                return
+            original(hardware, path, value)
+        with mock.patch.object(broker.Hardware, 'write', ignored_write):
+            with self.assertRaisesRegex(RuntimeError, 'did not hold.*requested.*observed'):
+                broker.command('4000')
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertEqual(self.writes[-1], ('fan2_target', 0))
+
+    def test_already_enabled_parameter_is_not_written_again(self):
+        self.param.write_text('Y\n')
+        with mock.patch.object(broker, 'secure_regular', wraps=self.open_fixture) as opened:
+            PRODUCTION_ENABLE(broker.Hardware())
+        self.assertEqual(opened.call_count, 1)
+        self.assertEqual(opened.call_args.kwargs, {})
+        self.assertEqual(self.param.read_text(), 'Y\n')
+
+    def test_invalid_repair_history_becomes_unknown(self):
+        broker.command('4000')
+        state = broker.load_state()
+        for value in ([float('nan')], [1, 2, 3], ['100'], [-1]):
+            (self.runtime / 'state.json').write_text(json.dumps({**state, 'repairs': value}))
+            self.assertEqual(broker.status()['mode'], 'unknown')
 
     def test_bad_second_fan_limit_causes_no_manual_writes(self):
         (self.hw / 'fan2_max').write_text('bad\n')
@@ -257,8 +307,8 @@ class Fixture(unittest.TestCase):
         broker.command('4000')
         (self.hw / 'fan1_target').write_text('5779')
         broker.watchdog_tick()
-        self.assertIn('another controller', broker.status()['error'])
-        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertIn('Recovered manual target drift', broker.status()['error'])
+        self.assertEqual(broker.status()['mode'], 'manual')
 
     def test_unknown_recovery_state_refuses_numeric_request(self):
         broker.save(broker.state_default('Could not restore automatic cooling'))
@@ -304,7 +354,7 @@ class Fixture(unittest.TestCase):
         state = broker.load_state()
         for changes in ({'expires_at': float('nan')}, {'targets': []}, {'owner_uid': '1000'},
                         {'targets': [{'index': 1, 'target': '4000'}]}, {'generation': '../bad'},
-                        {'inhibited': 'false'}):
+                        {'inhibited': 'false'}, {'recovering': 'false'}):
             with self.subTest(changes=changes):
                 (self.runtime / 'state.json').write_text(json.dumps({**state, **changes}))
                 self.assertEqual(broker.status()['mode'], 'unknown')

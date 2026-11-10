@@ -105,10 +105,16 @@ Resolve the reported error before retrying, or use the uninstall procedure.
   a random generation ID. Only the initiating widget renews that exact lease,
   every 3 seconds. Removing the widget, shell failure, read failure or a stale
   generation stops renewal.
-- A separate root watchdog checks every 2 seconds. It releases expired leases,
-  invalid or hot component readings (80 C), and changed hardware targets.
-  Firmware/another tool changing targets is treated as an override, not fought
-  with repeated low-speed writes.
+- A separate root watchdog checks every 2 seconds. It releases expired leases
+  and invalid or hot component readings (80 C). A transient target mismatch
+  triggers a verified attempt to restore your selected RPM, preserving the
+  same owner, lease ID and deadline. This first releases then reacquires manual
+  mode to repair stale kernel mode state. At most two repairs are attempted in
+  30 seconds; failed verification or repeated overrides return to Auto with
+  exact requested/observed values in the error. It does not fight an indefinite
+  hardware override. Your selection otherwise stays in manual while the
+  healthy widget renews it; the 12 seconds are a failure deadline, not a limit
+  on how long you can use manual control.
 - systemd monitors the watchdog with an 8-second watchdog timeout and restarts
   it after failure. Stop/failure handling attempts Auto. This cannot guarantee
   recovery if the kernel, systemd or hardware itself is unresponsive.

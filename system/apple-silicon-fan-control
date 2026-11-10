@@ -24,6 +24,9 @@ LEASE_SECONDS = 12.0
 WATCHDOG_INTERVAL = 2.0
 WATCHDOG_MAX_AGE = 6.0
 MAX_JSON = 65536
+MAX_DRIFT_REPAIRS = 2
+DRIFT_REPAIR_WINDOW = 30.0
+TARGET_SETTLE_SECONDS = 0.15
 
 
 def clock():
@@ -138,6 +141,11 @@ class Hardware:
 
     def enable(self):
         path = self.root / 'module/macsmc_hwmon/parameters/fan_control'
+        fd = secure_regular(path)
+        with os.fdopen(fd, 'r') as stream:
+            current = stream.read(16).strip()
+        if current in ('Y', '1'):
+            return
         fd = secure_regular(path, writable=True)
         with os.fdopen(fd, 'w') as stream:
             stream.write('1\n')
@@ -187,11 +195,9 @@ class Hardware:
         for index, path in self.fans:
             minimum, maximum = self.bounds(path)
             requests.append((index, path, min(maximum, max(minimum, rpm))))
-        self.check_temperatures()
-        self.enable()
-        for _, path, target in requests:
-            self.write(path, target)
-        return [{'index': index, 'target': value} for index, _, value in requests]
+        targets = [{'index': index, 'target': value} for index, _, value in requests]
+        self.reacquire(targets)
+        return targets
 
     def check_temperatures(self):
         sensors = list(self.directory.glob('temp*_input'))
@@ -202,19 +208,49 @@ class Hardware:
             if not re.fullmatch(r'-?[0-9]{1,7}', raw) or not -40000 <= int(raw) < 80000:
                 raise RuntimeError('Temperature invalid or at/above 80 C; releasing to firmware')
 
-    def matches(self, targets):
-        for target in targets:
-            path = self.directory / ('fan%d_target' % target['index'])
-            value = int(path.read_text().strip())
-            if abs(value - target['target']) > 10:
-                return False
-        return True
+    def observed_targets(self):
+        return [{'index': index, 'target': int(path.read_text().strip())}
+                for index, path in self.fans]
+
+    @staticmethod
+    def target_diagnostic(requested, observed):
+        def describe(values):
+            return ', '.join('fan%d=%d' % (item['index'], item['target']) for item in values)
+        return 'requested [' + describe(requested) + '] RPM; observed [' + describe(observed) + '] RPM'
+
+    def matches(self, targets, observed=None):
+        if observed is None:
+            observed = self.observed_targets()
+        values = {item['index']: item['target'] for item in observed}
+        return (set(values) == {item['index'] for item in targets}
+                and all(abs(values[item['index']] - item['target']) <= 10 for item in targets))
+
+    def reacquire(self, targets):
+        requested = {item['index']: item['target'] for item in targets}
+        if set(requested) != {index for index, _ in self.fans}:
+            raise RuntimeError('Fan inventory changed during manual control')
+        # A stale cached manual=true flag otherwise prevents the driver from
+        # writing mode=1 again. Zero first forces its next valid target to set
+        # manual mode in hardware. Validate all targets before touching any fan.
+        for index, path in self.fans:
+            minimum, maximum = self.bounds(path)
+            if not minimum <= requested[index] <= maximum:
+                raise RuntimeError('Hardware fan limits changed during manual control')
+        self.check_temperatures()
+        self.enable()
+        for index, path in self.fans:
+            self.write(path, 0)
+            self.write(path, requested[index])
+        time.sleep(TARGET_SETTLE_SECONDS)
+        observed = self.observed_targets()
+        if not self.matches(targets, observed):
+            raise RuntimeError('Manual target did not hold: ' + self.target_diagnostic(targets, observed))
 
 
 def state_default(error=None):
     return {'schema_version': 1, 'mode': 'unknown', 'owner_uid': None,
             'expires_at': 0, 'boot_id': boot_id(), 'generation': uuid.uuid4().hex,
-            'targets': [], 'inhibited': False, 'error': error}
+            'targets': [], 'inhibited': False, 'error': error, 'repairs': [], 'recovering': False}
 
 
 def load_state():
@@ -226,12 +262,16 @@ def load_state():
         expiry = state.get('expires_at')
         owner = state.get('owner_uid')
         targets = state.get('targets')
+        repairs = state.setdefault('repairs', [])
+        recovering = state.setdefault('recovering', False)
         if (state.get('schema_version') != 1 or mode not in ('auto', 'manual', 'unknown')
                 or type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry < 0
                 or (owner is not None and (type(owner) is not int or owner < 0))
                 or not re.fullmatch(r'[0-9a-f]{32}', str(state.get('generation', '')))
-                or type(state.get('inhibited')) is not bool
+                or type(state.get('inhibited')) is not bool or type(recovering) is not bool
                 or not isinstance(targets, list) or len(targets) > 64
+                or not isinstance(repairs, list) or len(repairs) > MAX_DRIFT_REPAIRS
+                or any(type(value) not in (int, float) or not math.isfinite(value) or value < 0 for value in repairs)
                 or (state.get('error') is not None and not isinstance(state.get('error'), str))):
             raise RuntimeError('Invalid broker state fields')
         indices = set()
@@ -371,8 +411,26 @@ def watchdog_tick():
                     raise RuntimeError('Manual lease expired')
                 hardware = Hardware()
                 hardware.check_temperatures()
-                if not hardware.matches(state.get('targets', [])):
-                    raise RuntimeError('Firmware or another controller changed fan targets')
+                observed = hardware.observed_targets()
+                if not hardware.matches(state['targets'], observed):
+                    diagnostic = hardware.target_diagnostic(state['targets'], observed)
+                    repairs = [value for value in state['repairs']
+                               if clock() - value < DRIFT_REPAIR_WINDOW]
+                    if len(repairs) >= MAX_DRIFT_REPAIRS:
+                        raise RuntimeError('Manual targets repeatedly overridden after %d repairs in %d seconds: %s'
+                                           % (MAX_DRIFT_REPAIRS, DRIFT_REPAIR_WINDOW, diagnostic))
+                    # Preserve generation, owner and expiry across recovery. A
+                    # repair must never renew an abandoned UI's manual lease.
+                    pending = {**state, 'mode': 'unknown', 'recovering': True, 'error': 'Recovering manual target drift: ' + diagnostic}
+                    save(pending)
+                    hardware.reacquire(state['targets'])
+                    hardware.check_temperatures()
+                    if clock() >= state['expires_at']:
+                        raise RuntimeError('Manual lease expired during target recovery')
+                    state['recovering'] = False
+                    state['repairs'] = repairs + [clock()]
+                    state['error'] = 'Recovered manual target drift: ' + diagnostic
+                    save(state)
             except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
                 reset(str(exc))
         elif state.get('mode') != 'auto':

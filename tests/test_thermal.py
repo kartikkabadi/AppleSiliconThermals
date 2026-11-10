@@ -65,6 +65,16 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(result['mode'], 'unknown')
         self.assertFalse(result['fan_control_enabled'])
 
+    def test_recovering_lease_preserves_owner_but_disables_numeric_control(self):
+        self.fan()
+        result = self.reader.get({**self.control('unknown'), 'ready': False, 'recovering': True})
+        self.assertTrue(result['lease_owned'])
+        self.assertTrue(result['lease_recovering'])
+        self.assertFalse(result['fan_control_enabled'])
+        self.assertEqual(result['mode'], 'unknown')
+        result = self.reader.get({**self.control('unknown'), 'ready': False, 'recovering': True, 'owner_uid': os.getuid()+1})
+        self.assertFalse(result['lease_owned'])
+
     def test_no_authorization_disables_controls(self):
         self.fan()
         result = self.reader.get({**self.control(), 'permitted': False})

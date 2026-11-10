@@ -5,6 +5,8 @@ only where necessary to exercise descriptor/locking behavior as a normal user.
 """
 import importlib.machinery
 import importlib.util
+import contextlib
+import copy
 import os
 from pathlib import Path
 import stat
@@ -108,6 +110,129 @@ class OperatingSystemBoundaryTests(unittest.TestCase):
         self.assertFalse(failures, repr(failures))
         self.assertEqual(measurements['count'], 8)
         self.assertEqual(measurements['maximum'], 1)
+
+
+class DriftRepairSafetyTests(unittest.TestCase):
+    """Exercise watchdog policy independently from sysfs/ownership fixtures."""
+    def setUp(self):
+        self.now = 100.0
+        self.reacquisitions = []
+        self.auto_resets = 0
+        self.hot = False
+        self.repair_duration = 0
+        self.requested = [{'index': 1, 'target': 4000}, {'index': 2, 'target': 4500}]
+        self.observed = [{'index': 1, 'target': 3000}, {'index': 2, 'target': 3000}]
+        self.state = {
+            'schema_version': 1, 'mode': 'manual', 'owner_uid': 1000,
+            'expires_at': 112.0, 'boot_id': 'fixture-boot', 'generation': 'a' * 32,
+            'targets': copy.deepcopy(self.requested), 'repairs': [],
+            'inhibited': False, 'error': None,
+        }
+        self.hardware = mock.Mock()
+        self.hardware.check_temperatures.side_effect = self.check_temperatures
+        self.hardware.observed_targets.side_effect = lambda: copy.deepcopy(self.observed)
+        # Save references before replacing Hardware with a factory.
+        self.matches = broker.Hardware.matches
+        self.diagnostic = broker.Hardware.target_diagnostic
+        self.hardware.matches.side_effect = lambda requested, observed: self.matches(None, requested, observed)
+        self.hardware.target_diagnostic.side_effect = self.diagnostic
+        self.hardware.reacquire.side_effect = self.reacquire
+        self.hardware.automatic.side_effect = self.automatic
+        for name, value in (
+            ('clock', lambda: self.now), ('boot_id', lambda: 'fixture-boot'),
+            ('locked', contextlib.nullcontext), ('Hardware', lambda: self.hardware),
+            ('load_state', lambda: copy.deepcopy(self.state)),
+            ('save', self.save), ('atomic_json', lambda *_args: None),
+        ):
+            patcher = mock.patch.object(broker, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def save(self, state):
+        self.state = copy.deepcopy(state)
+
+    def check_temperatures(self):
+        if self.hot:
+            raise RuntimeError('Temperature invalid or at/above 80 C')
+
+    def reacquire(self, targets):
+        self.reacquisitions.append(copy.deepcopy(targets))
+        self.observed = copy.deepcopy(targets)
+        self.now += self.repair_duration
+
+    def automatic(self):
+        self.auto_resets += 1
+
+    def drift(self):
+        self.observed[0]['target'] = 3000
+
+    def test_repair_preserves_uid_generation_expiry_and_requested_fans(self):
+        before = copy.deepcopy(self.state)
+        broker.watchdog_tick()
+        self.assertEqual(self.state['mode'], 'manual')
+        for field in ('owner_uid', 'generation', 'expires_at', 'targets', 'boot_id'):
+            self.assertEqual(self.state[field], before[field], field)
+        self.assertEqual(self.reacquisitions, [self.requested])
+        self.assertEqual(self.state['repairs'], [100.0])
+        self.assertEqual(self.auto_resets, 0)
+
+    def test_expired_or_hot_lease_is_released_without_attempting_repair(self):
+        for expiry, hot in ((99, False), (112, True)):
+            with self.subTest(expiry=expiry, hot=hot):
+                self.state.update(mode='manual', expires_at=expiry, repairs=[])
+                self.hot = hot
+                self.reacquisitions.clear()
+                broker.watchdog_tick()
+                self.assertEqual(self.state['mode'], 'auto')
+                self.assertEqual(self.reacquisitions, [])
+
+    def test_third_drift_in_window_releases_instead_of_fighting_indefinitely(self):
+        for _ in range(2):
+            broker.watchdog_tick()
+            self.now += 1
+            self.drift()
+        self.assertEqual(len(self.reacquisitions), 2)
+        broker.watchdog_tick()
+        self.assertEqual(len(self.reacquisitions), 2)
+        self.assertEqual(self.state['mode'], 'auto')
+        self.assertIn('repeatedly overridden', self.state['error'])
+        self.assertIn('requested', self.state['error'])
+        self.assertIn('observed', self.state['error'])
+
+    def test_sliding_window_retains_recent_repair_budget(self):
+        self.state['expires_at'] = 1000
+        self.state['repairs'] = [70.0, 99.0]
+        broker.watchdog_tick()
+        self.assertEqual(self.state['repairs'], [99.0, 100.0])
+        self.now = 101
+        self.drift()
+        broker.watchdog_tick()
+        self.assertEqual(self.state['mode'], 'auto')
+        self.assertEqual(len(self.reacquisitions), 1)
+
+    def test_repair_crossing_lease_deadline_is_not_published_manual(self):
+        self.repair_duration = 13
+        broker.watchdog_tick()
+        self.assertEqual(self.state['mode'], 'auto')
+        self.assertIn('expired', self.state['error'])
+        self.assertEqual(self.auto_resets, 1)
+
+    def test_heat_appearing_during_repair_releases_before_publishing_manual(self):
+        original = self.reacquire
+        def heats_during_repair(targets):
+            original(targets)
+            self.hot = True
+        self.hardware.reacquire.side_effect = heats_during_repair
+        broker.watchdog_tick()
+        self.assertEqual(self.state['mode'], 'auto')
+        self.assertIn('80 C', self.state['error'])
+        self.assertEqual(self.auto_resets, 1)
+
+    def test_failed_reacquisition_releases_instead_of_republishing_manual(self):
+        self.hardware.reacquire.side_effect = RuntimeError('Manual target did not hold')
+        broker.watchdog_tick()
+        self.assertEqual(self.state['mode'], 'auto')
+        self.assertIn('did not hold', self.state['error'])
 
 
 if __name__ == '__main__':

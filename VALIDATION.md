@@ -13,6 +13,19 @@
 - Mode-switch fixtures cover exact non-step targets, recreation in both layouts,
   queued edit cancellation, no-lowering transfer, Auto precedence, safety aborts,
   and release events from hidden or disabled sliders.
+- GitHub Actions passed for production commit `d32554e` on Ubuntu 22.04 and
+  24.04: https://github.com/kartikkabadi/AppleSiliconThermals/actions/runs/42799398823
+  (QML cases skip without installed Omarchy modules).
+- Updated the installed plugin to 2.3 and restarted the shell. The previous
+  independent 2300/2500 targets and Separate layout remained intact. Selecting
+  Linked in the live popup saved 2500 for both channels; actual sysfs targets
+  confirmed 2500/2500. A second shell restart preserved the same shared request
+  and generation, with the supervisor continuously active and no errors.
+- The live Linked panel rendered a single slider, all three RPM-labelled presets,
+  the layout selector, remembered indicator, and both fan telemetry cards.
+  Subsequent live user interaction selected shared Max (6241 requested, clamped
+  to 5779/6241); that latest choice was left unchanged.
+- No machine reboot or suspend was performed; reboot remains fixture-tested.
 - Hardware control, privilege policy and root service code are unchanged by 2.3.
   Existing independent targets are preserved until the user selects Linked.
 

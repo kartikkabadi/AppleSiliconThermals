@@ -8,7 +8,8 @@ supervised hardware override.
 This fork builds on [LukasMoriarty/AppleSiliconThermals](https://github.com/LukasMoriarty/AppleSiliconThermals)
 and retains its MIT license. Version 2 replaces the original shell telemetry and
 unbounded manual override with validated JSON and supervised fan control.
-Version 2.1 remembers your selected mode and RPM across bar restarts and reboot.
+Version 2.2 gives each fan its own slider and remembered RPM across bar restarts
+and reboot. Version 2.1 shared settings migrate without losing the saved choice.
 
 ## Requirements and support
 
@@ -95,7 +96,8 @@ Resolve the reported error before retrying, or use the uninstall procedure.
 
 ### Remembered mode and RPM
 
-Choosing Manual, a preset, or the slider saves your chosen RPM. The root control
+Each fan card has its own slider and Quiet/Balanced/Max presets. Adjusting one
+fan saves its chosen RPM while preserving the other fan settings. The root control
 service maintains it independently of the widget and restores it after service
 restart, shell restart, login and reboot. Closing the popup or disabling the
 widget does not change the saved choice. Choose **Auto** to save automatic
@@ -108,25 +110,43 @@ The preference is an atomic, root-owned JSON file at:
 /var/lib/apple-silicon-fan-control/preference.json
 ```
 
-The file records mode, requested RPM and the requesting account. It does not
+The file records mode, a requested RPM per fan index, and the requesting account. It does not
 contain executable code or arbitrary paths. Writes include file and directory
 synchronization so an acknowledged choice is durable. Runtime state under
 `/run` is separate; discarding runtime state does not discard your preference.
 The popup distinguishes your saved choice from the current hardware mode. A
 safety pause retains the choice and explains why it is temporarily inactive.
 
+### Upgrading existing saved settings
+
+A version 2.1 preference is read as a shared setting without rewriting its file.
+The first individual adjustment captures the detected fan inventory and the
+other fans' desired, clamped targets, then saves the complete independent map.
+Numeric `helper.sh set <RPM>` remains available as a shared compatibility action;
+`helper.sh set-fan <index> <RPM>` changes one channel. The root interface accepts
+only indices 1–64 and bounded numeric RPM, never paths or executable arguments.
+
+Independent maps must match the detected inventory exactly. Missing or newly
+appeared fans pause the saved setting rather than applying another channel's
+RPM. Select Auto, then configure the available fans again after a hardware
+inventory change. Changing hardware limits replans the actual clamp while
+retaining the originally requested RPM in the saved preference.
+
 ### Hardware control and recovery
 
 - Requests are four-digit RPM values from 1000 through 7999. Each fan is clamped
-  to its own hardware range. Maximum uses the real highest detected maximum;
-  the other fan may have a lower limit. The shared slider controls both fans.
+  to its own hardware range. Each slider and Max preset uses that fan's own
+  minimum and maximum.
 - These are fixed RPM settings, not temperature curves. Quiet and Balanced are
-  25% and 50% of the highest maximum, clamped per fan.
+  25% and 50% of each fan's own maximum, clamped to its range.
 - The broker serializes all writes and validates all channels before a change.
   A write journal marks incomplete changes as unknown so interrupted requests
   trigger recovery rather than leaving a false success state.
 - Initial manual application forces a known driver-mode transition and verifies
   target readback. Physical fan RPM can take a few seconds to reach the target.
+  A healthy one-fan adjustment does not rewrite unchanged fan registers. Rapid
+  changes to different sliders are queued independently; pending changes to the
+  same fan coalesce to its latest value, and Auto cancels pending manual changes.
 - The service checks hardware every 2 seconds. Transient target drift gets at
   most two verified repairs within 30 seconds. Repeated refusal pauses manual
   control with the requested and observed values; a cooldown prevents continuous
@@ -165,8 +185,8 @@ Set `"spinIcon": false` in this widget's `bar.layout` entry in
 follows Omarchy's reduce-motion preference. The popup scrolls to fit smaller
 screens; it supports Escape and focusable controls. Fan cards distinguish
 current RPM from target RPM, while gauges show speed relative to each fan maximum.
-A single Auto/Manual selector replaces duplicate actions; preset cards show
-their target RPM and component details can be expanded when needed. English strings are in
+One Auto/Manual selector controls the overall mode. Manual sliders and presets
+live inside each fan card; component details can be expanded when needed. English strings are in
 `i18n/en.json`; the selected Omarchy language falls back to English until its
 catalog is supplied. Sensor/model names are displayed as plain text.
 
@@ -226,8 +246,8 @@ python3 -m py_compile thermal.py system/apple-silicon-fan-control
 Python tests use isolated temporary sysfs/runtime fixtures and do not require
 root or write host fan settings. JavaScript tests validate the QML parser,
 malformed data and markup neutralization. CI runs these on Ubuntu 22.04/24.04.
-The same Python command also runs three headless QML integration tests when
-Omarchy UI modules and Quickshell are installed; otherwise those three tests skip.
+The same Python command also runs four headless QML integration tests when
+Omarchy UI modules and Quickshell are installed; otherwise those four tests skip.
 
 See [VALIDATION.md](VALIDATION.md) for completed physical checks on the M1 Pro,
 including maximum writes and watchdog recovery. Earlier lease-expiry checks

@@ -13,6 +13,8 @@ function fixture(changes = {}) {
     device_model: 'Apple MacBook Pro', fan_rpm: 2500, fan_target: 2500,
     fan_min: 1200, fan_max: 6241, mode: 'unknown',
     fan_control_enabled: true, control_available: true, persistent: true,
+    per_fan_control: true, saved_mode: 'auto', saved_control_mode: 'auto',
+    saved_fans: [], saved_rpm: null,
     fans: [{index: 1, label: 'Fan 1', rpm: 2300, min: 1200, max: 5779, target: 2317},
            {index: 2, label: 'Fan 2', rpm: 2500, min: 1200, max: 6241, target: 2502}],
     sensors: {nand: 0, battery: 34.5, regulator: null, wifi: 49},
@@ -55,13 +57,67 @@ test('legacy or malformed persistence capability cannot enable lasting controls'
   assert.equal(parse({persistent: true}).controlEnabled, true);
 });
 test('saved manual preferences require integer RPM and integer owner', () => {
-  const valid = {saved_mode: 'manual', saved_rpm: 4000, saved_owner_uid: 1000};
+  const valid = {saved_mode: 'manual', saved_control_mode: 'shared', saved_rpm: 4000, saved_owner_uid: 1000};
   const result = parse(valid);
   assert.equal(result.savedMode, 'manual');
   assert.equal(result.savedRpm, 4000);
   assert.equal(result.savedOwnerUid, 1000);
   assert.equal(parse({...valid, saved_rpm: 4000.5}).savedRpm, null);
   assert.equal(parse({...valid, saved_owner_uid: 1000.5}).savedOwnerUid, null);
+});
+test('legacy capability cannot enable independent fan writes', () => {
+  for (const per_fan_control of [false, undefined, null, 'true', 1])
+    assert.equal(parse({per_fan_control}).controlEnabled, false);
+});
+test('unequal saved fan targets map by channel index rather than array position', () => {
+  const data = parse({saved_mode: 'manual', saved_control_mode: 'individual',
+    saved_fans: [{index: 2, rpm: 5000}, {index: 1, rpm: 1600}]});
+  assert.equal(data.savedFansValid, true);
+  assert.equal(data.preferenceValid, true);
+  assert.equal(data.controlEnabled, true);
+  assert.equal(data.savedFans.find(fan => fan.index === 1).rpm, 1600);
+  assert.equal(data.savedFans.find(fan => fan.index === 2).rpm, 5000);
+  assert.equal(data.savedRpm, null);
+});
+test('invalid per-fan target maps never enable numeric controls', () => {
+  const valid = [{index: 1, rpm: 1600}, {index: 2, rpm: 5000}];
+  const malformed = [null, {}, 'targets', [valid[0], valid[0]],
+    [{index: 1.5, rpm: 1600}, valid[1]], [{index: '1', rpm: 1600}, valid[1]],
+    [{index: 0, rpm: 1600}, valid[1]], [{index: 65, rpm: 1600}, valid[1]],
+    [{index: 1, rpm: 1600.5}, valid[1]], [{index: 1, rpm: '1600'}, valid[1]],
+    [{index: 1, rpm: 999}, valid[1]], [{index: 1, rpm: 8000}, valid[1]],
+    Array.from({length: 65}, (_, i) => ({index: i + 1, rpm: 1600}))];
+  for (const saved_fans of malformed) {
+    const data = parse({saved_mode: 'manual', saved_control_mode: 'individual', saved_fans});
+    assert.equal(data.savedFansValid, false);
+    assert.equal(data.preferenceValid, false);
+    assert.equal(data.controlEnabled, false);
+  }
+});
+test('missing and newly appeared physical fans invalidate individual preference matching', () => {
+  for (const saved_fans of [[{index: 1, rpm: 1600}],
+                           [{index: 1, rpm: 1600}, {index: 3, rpm: 5000}],
+                           [{index: 1, rpm: 1600}, {index: 2, rpm: 5000}, {index: 3, rpm: 3000}]]) {
+    const data = parse({saved_mode: 'manual', saved_control_mode: 'individual', saved_fans});
+    assert.equal(data.savedFansValid, true);
+    assert.equal(data.preferenceValid, false);
+    assert.equal(data.controlEnabled, false);
+  }
+});
+test('canonical mode combinations do not accept contradictory shared and individual data', () => {
+  for (const data of [
+    {saved_mode: 'auto', saved_control_mode: 'auto', saved_fans: [{index: 1, rpm: 1600}]},
+    {saved_mode: 'auto', saved_control_mode: 'auto', saved_rpm: 4000},
+    {saved_mode: 'manual', saved_control_mode: 'shared', saved_rpm: 4000, saved_fans: [{index: 1, rpm: 1600}]},
+    {saved_mode: 'manual', saved_control_mode: 'individual', saved_rpm: 4000,
+     saved_fans: [{index: 1, rpm: 1600}, {index: 2, rpm: 5000}]},
+  ]) assert.equal(parse(data).preferenceValid, false);
+});
+test('saved requests above a current hardware maximum remain valid desired values', () => {
+  const data = parse({saved_mode: 'manual', saved_control_mode: 'individual',
+    saved_fans: [{index: 1, rpm: 6241}, {index: 2, rpm: 6241}]});
+  assert.equal(data.preferenceValid, true);
+  assert.equal(data.savedFans.find(fan => fan.index === 1).rpm, 6241);
 });
 test('fanless/error states cannot enable numeric controls', () => {
   assert.equal(parse({has_fan: false}).controlEnabled, false);
@@ -118,4 +174,5 @@ test('high-index fans remain visible and fan count is derived', () => {
   const fans = fixture().fans; fans[1].index = 999;
   const data = parse({fans, fan_count: 9999});
   assert.equal(data.fanCount, 2); assert.equal(data.fans[1].index, 999);
+  assert.equal(data.controlEnabled, false);
 });

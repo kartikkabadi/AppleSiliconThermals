@@ -503,6 +503,170 @@ class Fixture(unittest.TestCase):
                 self.assertIsNotNone(broker.load_preference()[1])
 
 
+    def test_independent_edit_preserves_other_fan_and_does_not_write_it(self):
+        broker.command('4000')
+        self.writes.clear()
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        self.assertEqual(self.writes, [('fan1_target', 0), ('fan1_target', 3500)])
+        self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '4000')
+        state = broker.status()
+        self.assertTrue(state['per_fan_control'])
+        self.assertEqual(state['control_mode'], 'individual')
+        self.assertIsNone(state['saved_rpm'])
+        self.assertEqual(state['saved_fans'], [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 4000}])
+        self.writes.clear()
+        broker.command('fan', fan_index=2, fan_rpm=5000)
+        self.assertEqual(self.writes, [('fan2_target', 0), ('fan2_target', 5000)])
+        self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '3500')
+
+    def test_shared_max_seed_uses_each_fans_clamped_limit(self):
+        broker.command('6241')
+        self.writes.clear()
+        broker.command('fan', fan_index=2, fan_rpm=4000)
+        self.assertEqual(self.writes, [('fan2_target', 0), ('fan2_target', 4000)])
+        self.assertEqual(broker.status()['saved_fans'], [{'index': 1, 'rpm': 5779}, {'index': 2, 'rpm': 4000}])
+
+    def test_first_individual_edit_from_auto_freezes_unchanged_fan_setpoint(self):
+        (self.hw / 'fan1_target').write_text('2317')
+        (self.hw / 'fan2_target').write_text('2502')
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        self.assertEqual(broker.status()['saved_fans'], [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 2502}])
+        self.assertEqual(self.writes, [('fan1_target', 0), ('fan1_target', 3500), ('fan2_target', 0), ('fan2_target', 2502)])
+
+    def test_individual_update_preserves_other_raw_intent_even_when_clamped(self):
+        broker.command('fan', fan_index=2, fan_rpm=7999)
+        self.writes.clear()
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        self.assertEqual(broker.status()['saved_fans'][1], {'index': 2, 'rpm': 7999})
+        self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '6241')
+        self.assertEqual(self.writes, [('fan1_target', 0), ('fan1_target', 3500)])
+
+    def test_schema_one_is_read_only_migrated_until_explicit_setting_change(self):
+        legacy = {'schema_version': 1, 'mode': 'manual', 'rpm': 4000,
+                  'owner_uid': 0, 'generation': 'a' * 32}
+        evidence = json.dumps(legacy).encode()
+        path = self.persistence / 'preference.json'
+        path.write_bytes(evidence)
+        preference, error = broker.load_preference()
+        self.assertIsNone(error)
+        self.assertEqual(preference['schema_version'], 2)
+        self.assertEqual(preference['control_mode'], 'shared')
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'manual')
+        self.assertEqual(path.read_bytes(), evidence)
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        stored = json.loads(path.read_text())
+        self.assertEqual(stored['schema_version'], 2)
+        self.assertEqual(stored['control_mode'], 'individual')
+
+    def test_cold_boot_restores_unequal_targets_and_keeps_saved_map(self):
+        broker.command('fan', fan_index=1, fan_rpm=3200)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        evidence = (self.persistence / 'preference.json').read_bytes()
+        generation = broker.status()['generation']
+        with mock.patch.object(broker, 'boot_id', return_value='cold-reboot'):
+            broker.reset()
+            broker.watchdog_tick()
+            state = broker.status()
+            self.assertEqual(state['mode'], 'manual')
+            self.assertEqual(state['generation'], generation)
+            self.assertEqual(state['saved_fans'], [{'index': 1, 'rpm': 3200}, {'index': 2, 'rpm': 4700}])
+            self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '3200')
+            self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '4700')
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+
+    def test_missing_or_new_fan_pauses_individual_map_without_remapping(self):
+        broker.command('fan', fan_index=1, fan_rpm=3200)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        evidence = (self.persistence / 'preference.json').read_bytes()
+        for suffix in ('input', 'target', 'min', 'max'):
+            (self.hw / ('fan2_' + suffix)).unlink()
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+        self.now += 31
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertIn('inventory', broker.status()['error'])
+        with self.assertRaisesRegex(RuntimeError, 'inventory'):
+            broker.command('fan', fan_index=1, fan_rpm=3500)
+        for index, maximum in ((2, 6241), (3, 5000)):
+            for suffix, value in (('input', 2400), ('target', 2400), ('min', 1200), ('max', maximum)):
+                (self.hw / ('fan%d_%s' % (index, suffix))).write_text(str(value))
+        self.now += 31
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        self.assertIn('inventory', broker.status()['error'])
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+
+    def test_selected_fan_can_replace_unrepresentable_old_auto_setpoint(self):
+        (self.hw / 'fan1_min').write_text('100')
+        (self.hw / 'fan1_max').write_text('900')
+        (self.hw / 'fan1_target').write_text('600')
+        broker.command('fan', fan_index=1, fan_rpm=1000)
+        self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '900')
+        self.assertEqual(broker.status()['saved_fans'][0], {'index': 1, 'rpm': 1000})
+
+    def test_unchanged_unrepresentable_auto_setpoint_is_not_silently_changed(self):
+        (self.hw / 'fan2_min').write_text('100')
+        (self.hw / 'fan2_max').write_text('900')
+        (self.hw / 'fan2_target').write_text('600')
+        with self.assertRaisesRegex(RuntimeError, 'cannot be represented safely'):
+            broker.command('fan', fan_index=1, fan_rpm=3500)
+        self.assertEqual(self.writes, [])
+        self.assertFalse((self.persistence / 'preference.json').exists())
+
+    def test_active_limits_change_reclamps_without_rewriting_desired_map(self):
+        broker.command('fan', fan_index=1, fan_rpm=5000)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        evidence = (self.persistence / 'preference.json').read_bytes()
+        generation = broker.status()['generation']
+        (self.hw / 'fan1_max').write_text('4000')
+        broker.watchdog_tick()
+        state = broker.status()
+        self.assertEqual(state['mode'], 'manual')
+        self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '4000')
+        self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '4700')
+        self.assertEqual(state['generation'], generation)
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+
+    def test_nonexistent_fan_edit_is_rejected_before_hardware_or_preference_write(self):
+        broker.command('4000')
+        previous = (self.persistence / 'preference.json').read_bytes()
+        self.writes.clear()
+        with self.assertRaisesRegex(RuntimeError, 'does not exist'):
+            broker.command('fan', fan_index=64, fan_rpm=3500)
+        self.assertEqual(self.writes, [])
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), previous)
+
+    def test_schema_two_individual_map_validation_is_strict(self):
+        preference = {'schema_version': 2, 'mode': 'manual', 'control_mode': 'individual',
+                      'rpm': None, 'fans': [{'index': 1, 'rpm': 3500}], 'owner_uid': 0,
+                      'generation': 'b' * 32}
+        invalid = ([], [{'index': 1, 'rpm': 3500}, {'index': 1, 'rpm': 4000}],
+                   [{'index': 0, 'rpm': 3500}], [{'index': 65, 'rpm': 3500}],
+                   [{'index': True, 'rpm': 3500}], [{'index': 1, 'rpm': True}],
+                   [{'index': 1, 'rpm': 3500.5}], [{'index': 1, 'rpm': 999}],
+                   [{'index': 1, 'rpm': 8000}], [{'index': 1, 'rpm': 3500, 'path': '/tmp'}])
+        for fans in invalid:
+            with self.subTest(fans=fans), self.assertRaises(RuntimeError):
+                broker.validate_preference({**preference, 'fans': fans})
+        for changes in ({'rpm': 3500}, {'control_mode': 'shared'}, {'mode': 'auto'}, {'owner_uid': True}):
+            with self.assertRaises(RuntimeError):
+                broker.validate_preference({**preference, **changes})
+
+    def test_legacy_shared_command_replaces_individual_map_explicitly(self):
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        broker.command('4500')
+        state = broker.status()
+        self.assertEqual(state['control_mode'], 'shared')
+        self.assertEqual(state['saved_rpm'], 4500)
+        self.assertEqual(state['saved_fans'], [])
+        self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '4500')
+        self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '4500')
+
+
 
 
 class Security(unittest.TestCase):
@@ -512,6 +676,23 @@ class Security(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     broker.main()
                 hardware.assert_not_called()
+
+    def test_per_fan_cli_rejects_invalid_indices_rpms_and_argument_counts(self):
+        invalid = (['fan'], ['fan', '1'], ['fan', '1', '4000', 'extra'],
+                   ['fan', '0', '4000'], ['fan', '65', '4000'], ['fan', '01', '4000'],
+                   ['fan', '-1', '4000'], ['fan', '1', '999'], ['fan', '1', '8000'],
+                   ['fan', '1', '4000;id'], ['fan', '1;id', '4000'], ['fan', '1', '04000'])
+        for arguments in invalid:
+            with self.subTest(arguments=arguments), mock.patch.object(broker.sys, 'argv', ['broker', *arguments]), mock.patch.object(broker, 'Hardware') as hardware:
+                with self.assertRaises(RuntimeError):
+                    broker.main()
+                hardware.assert_not_called()
+
+    def test_per_fan_cli_accepts_bounded_exact_protocol(self):
+        for index in ('1', '9', '10', '59', '60', '64'):
+            with self.subTest(index=index), mock.patch.object(broker.sys, 'argv', ['broker', 'fan', index, '4000']), mock.patch.object(broker.os, 'geteuid', return_value=0), mock.patch.object(broker, 'command') as command, mock.patch.object(broker, 'status', return_value={}), contextlib.redirect_stdout(__import__('io').StringIO()):
+                broker.main()
+                command.assert_called_once_with('fan', None, int(index), 4000)
 
     def test_extra_argument_rejected(self):
         with mock.patch.object(broker.sys, 'argv', ['broker', 'auto', 'extra']):

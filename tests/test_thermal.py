@@ -109,6 +109,27 @@ class TelemetryTests(unittest.TestCase):
         self.assertFalse(result['persistent'])
         self.assertEqual(result['saved_mode'], 'unknown')
 
+    def test_individual_saved_values_remain_distinct(self):
+        self.fan()
+        self.fan(2, maximum=6241)
+        result = self.reader.get({**self.control('manual'), 'persistent': True,
+                                  'per_fan_control': True, 'saved_mode': 'manual',
+                                  'saved_control_mode': 'individual', 'control_mode': 'individual',
+                                  'saved_fans': [{'index': 2, 'rpm': 4500}, {'index': 1, 'rpm': 4000}]})
+        self.assertTrue(result['per_fan_control'])
+        self.assertEqual(result['saved_fans'], [{'index': 1, 'rpm': 4000}, {'index': 2, 'rpm': 4500}])
+        self.assertEqual(result['saved_control_mode'], 'individual')
+
+    def test_invalid_saved_map_disables_individual_capability(self):
+        self.fan()
+        for value in ([{'index': 1, 'rpm': 4000}, {'index': 1, 'rpm': 4500}],
+                      [{'index': 1, 'rpm': 4000.5}], [{'index': True, 'rpm': 4000}],
+                      [{'index': 65, 'rpm': 4000}], [{'index': 1, 'rpm': '4000'}]):
+            with self.subTest(value=value):
+                result = self.reader.get({**self.control('manual'), 'per_fan_control': True, 'saved_fans': value})
+                self.assertFalse(result['per_fan_control'])
+                self.assertTrue(result['preference_error'])
+
     def test_missing_or_invalid_fan_limits_disable_numeric_control(self):
         self.fan()
         for value in ['missing', 'NaN', '-1', '1000000000000000000', '10000']:
@@ -201,9 +222,19 @@ class TelemetryTests(unittest.TestCase):
 
     def test_mutating_cli_rejects_extra_args_and_shell_payloads(self):
         for argv in [['set', 'auto', 'extra'], ['set', '9999'], ['set', '1200;id'],
-                     ['heartbeat', 'extra'], ['--sys-root', '/tmp']]:
+                     ['heartbeat', 'extra'], ['--sys-root', '/tmp'],
+                     ['set-fan', '0', '4000'], ['set-fan', '65', '4000'],
+                     ['set-fan', '01', '4000'], ['set-fan', '../fan1', '4000'],
+                     ['set-fan', '1', '4000;id'], ['set-fan', '1', '4000', 'extra']]:
             with self.subTest(argv=argv), patch('builtins.print'):
                 self.assertEqual(thermal.main(argv), 64)
+
+    def test_per_fan_cli_passes_separate_bounded_arguments(self):
+        with patch.object(thermal, 'trusted_broker', return_value=True), \
+                patch.object(thermal, 'command_result', return_value={'ok': True, 'data': {'mode': 'manual'}}) as run, \
+                patch('builtins.print'):
+            self.assertEqual(thermal.main(['set-fan', '2', '4500']), 0)
+        self.assertEqual(run.call_args.args[0], ['/usr/bin/sudo', '-n', str(thermal.BROKER), 'fan', '2', '4500'])
 
     def test_control_command_errors_and_invalid_json(self):
         for program in ['print("not json")', 'print("[]")', 'raise SystemExit(2)', 'print("x"*20000)']:
@@ -234,6 +265,33 @@ class TelemetryTests(unittest.TestCase):
         self.assertTrue(result['permitted'])
         self.assertEqual(commands[0][-1], 'auto')
         self.assertIn('-l', commands[0])
+
+    def test_partial_policy_upgrade_preserves_auto_but_disables_per_fan(self):
+        def check(command, **_kwargs):
+            return subprocess.CompletedProcess(command, 0 if command[-1] == 'auto' else 1)
+        reply = {'ok': True, 'data': {'schema_version': 1, 'mode': 'auto', 'ready': True,
+                                     'persistent': True, 'per_fan_control': True}}
+        with patch.object(thermal, 'trusted_broker', return_value=True), \
+                patch.object(thermal, 'command_result', return_value=reply), \
+                patch.object(thermal.subprocess, 'run', side_effect=check):
+            result = thermal.broker_status()
+        self.assertTrue(result['permitted'])
+        self.assertFalse(result['per_fan_control'])
+        self.assertIn('Per-fan permission', result['error'])
+
+    def test_per_fan_permission_probe_uses_separate_arguments(self):
+        commands = []
+        def check(command, **_kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0)
+        reply = {'ok': True, 'data': {'schema_version': 1, 'mode': 'manual', 'ready': True,
+                                     'per_fan_control': True, 'targets': [{'index': 2, 'target': 4000}]}}
+        with patch.object(thermal, 'trusted_broker', return_value=True), \
+                patch.object(thermal, 'command_result', return_value=reply), \
+                patch.object(thermal.subprocess, 'run', side_effect=check):
+            result = thermal.broker_status()
+        self.assertTrue(result['per_fan_control'])
+        self.assertEqual(commands[1][-3:], ['fan', '2', '1000'])
 
 
 if __name__ == '__main__':

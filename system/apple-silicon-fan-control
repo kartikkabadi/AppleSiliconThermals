@@ -224,20 +224,75 @@ class Hardware:
         if errors:
             raise RuntimeError('; '.join(errors))
 
-    def manual(self, rpm):
-        requests = []
-        # Validate all fans before making the first write.
+    def planned_targets(self, rpm=None, fans=None):
+        # All fan channels must be controllable. Individual maps are matched by
+        # stable hwmon index, never by array position or a shifted channel list.
         inputs = {int(re.fullmatch(r'fan([1-9][0-9]*)_input', p.name)[1])
                   for p in self.directory.glob('fan*_input')
                   if re.fullmatch(r'fan([1-9][0-9]*)_input', p.name)}
-        if inputs != {index for index, _ in self.fans}:
+        indices = {index for index, _ in self.fans}
+        if inputs != indices:
             raise RuntimeError('Some fans have no controllable target')
+        individual = None
+        if fans is not None:
+            individual = {item['index']: item['rpm'] for item in validate_fans(fans)}
+            if set(individual) != indices:
+                raise RuntimeError('Saved fan inventory does not match this hardware; select Auto, then configure the available fans again')
+        targets = []
         for index, path in self.fans:
             minimum, maximum = self.bounds(path)
-            requests.append((index, path, min(maximum, max(minimum, rpm))))
-        targets = [{'index': index, 'target': value} for index, _, value in requests]
+            requested = individual[index] if individual is not None else rpm
+            if type(requested) is not int or not 1000 <= requested <= 7999:
+                raise RuntimeError('Invalid manual fan RPM')
+            targets.append({'index': index, 'target': min(maximum, max(minimum, requested))})
+        return targets
+
+    def manual(self, rpm):
+        targets = self.planned_targets(rpm=rpm)
         self.reacquire(targets)
         return targets
+
+    def manual_individual(self, fans, previous_targets=None):
+        targets = self.planned_targets(fans=fans)
+        changed_indices = None
+        if previous_targets is not None and self.matches(previous_targets):
+            old = {item['index']: item['target'] for item in previous_targets}
+            if set(old) == {item['index'] for item in targets}:
+                changed_indices = {item['index'] for item in targets if old[item['index']] != item['target']}
+        self.reacquire(targets, changed_indices=changed_indices)
+        return targets
+
+    def seed_individual(self, preference, changed_index, changed_rpm):
+        indices = {index for index, _ in self.fans}
+        if changed_index not in indices:
+            raise RuntimeError('Requested fan index does not exist on this hardware')
+        if preference['mode'] == 'manual' and preference['control_mode'] == 'individual':
+            # Exact inventory is intentional: never drop a missing fan or give
+            # a newly appeared channel someone else's saved target.
+            self.planned_targets(fans=preference['fans'])
+            desired = {item['index']: item['rpm'] for item in preference['fans']}
+        else:
+            if preference['mode'] == 'manual':
+                values = self.planned_targets(rpm=preference['rpm'])
+            else:
+                # An explicit first individual edit freezes the other channels
+                # at their current firmware setpoints, bounded by their limits.
+                self.planned_targets(rpm=1000)
+                values = self.observed_targets()
+            observed = {item['index']: item['target'] for item in values}
+            desired = {}
+            for index, path in self.fans:
+                if index == changed_index:
+                    desired[index] = changed_rpm
+                    continue
+                minimum, maximum = self.bounds(path)
+                value = min(maximum, max(minimum, observed[index]))
+                candidate = min(7999, max(1000, value))
+                if min(maximum, max(minimum, candidate)) != value:
+                    raise RuntimeError('An unchanged fan target cannot be represented safely; use the shared RPM command before individual configuration')
+                desired[index] = candidate
+        desired[changed_index] = changed_rpm
+        return [{'index': index, 'rpm': desired[index]} for index in sorted(desired)]
 
     def check_temperatures(self, limit=80000):
         sensors = list(self.directory.glob('temp*_input'))
@@ -265,7 +320,7 @@ class Hardware:
         return (set(values) == {item['index'] for item in targets}
                 and all(abs(values[item['index']] - item['target']) <= 10 for item in targets))
 
-    def reacquire(self, targets):
+    def reacquire(self, targets, changed_indices=None):
         requested = {item['index']: item['target'] for item in targets}
         if set(requested) != {index for index, _ in self.fans}:
             raise RuntimeError('Fan inventory changed during manual control')
@@ -277,36 +332,76 @@ class Hardware:
             if not minimum <= requested[index] <= maximum:
                 raise RuntimeError('Hardware fan limits changed during manual control')
         self.check_temperatures()
-        self.enable()
-        for index, path in self.fans:
-            self.write(path, 0)
-            self.write(path, requested[index])
-        time.sleep(TARGET_SETTLE_SECONDS)
+        selected = set(requested) if changed_indices is None else changed_indices
+        if not selected.issubset(requested):
+            raise RuntimeError('Invalid incremental fan update')
+        if selected:
+            self.enable()
+            for index, path in self.fans:
+                if index in selected:
+                    self.write(path, 0)
+                    self.write(path, requested[index])
+            time.sleep(TARGET_SETTLE_SECONDS)
         observed = self.observed_targets()
         if not self.matches(targets, observed):
             raise RuntimeError('Manual target did not hold: ' + self.target_diagnostic(targets, observed))
 
 
+def validate_fans(fans, allow_empty=False):
+    if not isinstance(fans, list) or len(fans) > 64 or (not fans and not allow_empty):
+        raise RuntimeError('Invalid saved per-fan target list')
+    seen = set()
+    result = []
+    for item in fans:
+        if (not isinstance(item, dict) or set(item) != {'index', 'rpm'}
+                or type(item['index']) is not int or not 1 <= item['index'] <= 64
+                or item['index'] in seen or type(item['rpm']) is not int
+                or not 1000 <= item['rpm'] <= 7999):
+            raise RuntimeError('Invalid or duplicate saved per-fan target')
+        seen.add(item['index'])
+        result.append({'index': item['index'], 'rpm': item['rpm']})
+    return sorted(result, key=lambda item: item['index'])
+
+
 def preference_default():
-    return {'schema_version': 1, 'mode': 'auto', 'rpm': None,
-            'owner_uid': None, 'generation': '0' * 32}
+    return {'schema_version': 2, 'mode': 'auto', 'control_mode': 'auto',
+            'rpm': None, 'fans': [], 'owner_uid': None, 'generation': '0' * 32}
 
 
 def validate_preference(value):
-    expected = {'schema_version', 'mode', 'rpm', 'owner_uid', 'generation'}
-    if (not isinstance(value, dict) or set(value) != expected
-            or type(value['schema_version']) is not int or value['schema_version'] != 1
-            or value['mode'] not in ('auto', 'manual')
+    old_fields = {'schema_version', 'mode', 'rpm', 'owner_uid', 'generation'}
+    new_fields = old_fields | {'control_mode', 'fans'}
+    if not isinstance(value, dict) or type(value.get('schema_version')) is not int:
+        raise RuntimeError('Invalid saved fan preference schema')
+    version = value['schema_version']
+    if version == 1 and set(value) == old_fields:
+        # Read-time migration only. Existing files remain untouched until the
+        # user explicitly selects a setting and saves schema 2.
+        value = {**value, 'schema_version': 2,
+                 'control_mode': 'shared' if value['mode'] == 'manual' else 'auto', 'fans': []}
+    elif version != 2 or set(value) != new_fields:
+        raise RuntimeError('Invalid saved fan preference schema')
+    if (value['mode'] not in ('auto', 'manual')
             or not isinstance(value['generation'], str)
             or not re.fullmatch(r'[0-9a-f]{32}', value['generation'])):
         raise RuntimeError('Invalid saved fan preference schema')
     if value['mode'] == 'auto':
-        if value['rpm'] is not None or value['owner_uid'] is not None:
+        if (value['control_mode'] != 'auto' or value['rpm'] is not None
+                or value['owner_uid'] is not None or value['fans'] != []):
             raise RuntimeError('Automatic preference must not contain a manual target')
-    elif (type(value['rpm']) is not int or not 1000 <= value['rpm'] <= 7999
-          or type(value['owner_uid']) is not int or not 0 <= value['owner_uid'] <= 4294967295):
-        raise RuntimeError('Invalid saved manual RPM or owner')
-    return value
+    else:
+        if type(value['owner_uid']) is not int or not 0 <= value['owner_uid'] <= 4294967295:
+            raise RuntimeError('Invalid saved manual owner')
+        if value['control_mode'] == 'shared':
+            if type(value['rpm']) is not int or not 1000 <= value['rpm'] <= 7999 or value['fans'] != []:
+                raise RuntimeError('Invalid saved shared RPM')
+        elif value['control_mode'] == 'individual':
+            if value['rpm'] is not None:
+                raise RuntimeError('Individual preference must not contain a shared RPM')
+            value = {**value, 'fans': validate_fans(value['fans'])}
+        else:
+            raise RuntimeError('Invalid saved control mode')
+    return dict(value)
 
 
 def secure_persistence(create=False):
@@ -328,7 +423,7 @@ def load_preference():
 
 
 def save_preference(preference):
-    validate_preference(preference)
+    preference = validate_preference(preference)
     secure_persistence(create=True)
     path = PERSISTENCE / 'preference.json'
     # Explicit user changes may replace malformed JSON, but never bypass an
@@ -343,7 +438,7 @@ def state_default(error=None):
     return {'schema_version': 1, 'mode': 'unknown', 'owner_uid': None,
             'expires_at': 0, 'boot_id': boot_id(), 'generation': uuid.uuid4().hex,
             'targets': [], 'inhibited': False, 'error': error, 'repairs': [],
-            'recovering': False, 'requested_rpm': None, 'retry_at': 0,
+            'recovering': False, 'requested_rpm': None, 'requested_fans': [], 'control_mode': 'auto', 'retry_at': 0,
             'thermal_paused': False, 'restore_blocked_generation': None, 'restore_blocked_reason': None}
 
 
@@ -359,6 +454,14 @@ def load_state():
         repairs = state.setdefault('repairs', [])
         recovering = state.setdefault('recovering', False)
         requested = state.setdefault('requested_rpm', None)
+        requested_fans = state.setdefault('requested_fans', [])
+        control_mode = state.setdefault('control_mode', 'shared' if mode == 'manual' else 'auto')
+        if control_mode not in ('auto', 'shared', 'individual') or validate_fans(requested_fans, allow_empty=True) != requested_fans:
+            raise RuntimeError('Invalid runtime per-fan control state')
+        if control_mode == 'individual' and (requested is not None or not requested_fans):
+            raise RuntimeError('Incomplete individual runtime targets')
+        if control_mode != 'individual' and requested_fans:
+            raise RuntimeError('Unexpected individual runtime targets')
         retry_at = state.setdefault('retry_at', 0)
         thermal_paused = state.setdefault('thermal_paused', False)
         blocked_generation = state.setdefault('restore_blocked_generation', None)
@@ -403,7 +506,9 @@ def watchdog_ready():
 
 def status():
     preference, preference_error = load_preference()
-    saved = {'persistent': True, 'saved_mode': preference['mode'],
+    saved = {'persistent': True, 'per_fan_control': True, 'saved_mode': preference['mode'],
+             'saved_control_mode': preference['control_mode'], 'saved_fans': preference['fans'],
+             'requested_fans': preference['fans'],
              'saved_rpm': preference['rpm'], 'saved_owner_uid': preference['owner_uid'],
              'preference_error': preference_error, 'requested_rpm': preference['rpm']}
     try:
@@ -461,19 +566,34 @@ def owner_uid():
     return int(value)
 
 
+def state_matches_preference(state, preference):
+    return (state['generation'] == preference['generation']
+            and state['owner_uid'] == preference['owner_uid']
+            and state['requested_rpm'] == preference['rpm']
+            and state['control_mode'] == preference['control_mode']
+            and state['requested_fans'] == preference['fans'])
+
+
 def apply_manual(preference, persist=False):
     previous = load_state()
+    prior_preference, prior_error = load_preference()
+    previous_targets = None
+    if (persist and preference['control_mode'] == 'individual' and prior_error is None
+            and previous['mode'] == 'manual' and state_matches_preference(previous, prior_preference)):
+        previous_targets = previous['targets']
     state = state_default('Applying saved manual target')
     if persist:
         state['restore_blocked_generation'] = previous.get('restore_blocked_generation')
         state['restore_blocked_reason'] = previous.get('restore_blocked_reason')
     state.update(owner_uid=preference['owner_uid'], generation=preference['generation'],
-                 requested_rpm=preference['rpm'], recovering=True)
+                 requested_rpm=preference['rpm'], requested_fans=preference['fans'],
+                 control_mode=preference['control_mode'], recovering=True)
     save(state)
     committed = False
     try:
         hardware = Hardware()
-        targets = hardware.manual(preference['rpm'])
+        targets = (hardware.manual_individual(preference['fans'], previous_targets=previous_targets)
+                   if preference['control_mode'] == 'individual' else hardware.manual(preference['rpm']))
         hardware.check_temperatures()
         if persist:
             save_preference(preference)
@@ -492,7 +612,7 @@ def apply_manual(preference, persist=False):
         raise RuntimeError('Manual control failed; automatic recovery attempted; ' + intent_note + ': ' + str(exc)) from exc
 
 
-def command(action, generation=None):
+def command(action, generation=None, fan_index=None, fan_rpm=None):
     with locked():
         if action in ('sleep', 'resume'):
             state = load_state()
@@ -550,8 +670,16 @@ def command(action, generation=None):
             return
         if state['mode'] == 'manual' and state['owner_uid'] != uid:
             raise RuntimeError('Another user owns the manual setting; select Auto first')
-        preference = {'schema_version': 1, 'mode': 'manual', 'rpm': int(action),
-                      'owner_uid': uid, 'generation': uuid.uuid4().hex}
+        if action == 'fan':
+            if type(fan_index) is not int or not 1 <= fan_index <= 64 or type(fan_rpm) is not int or not 1000 <= fan_rpm <= 7999:
+                raise RuntimeError('Invalid fan index or RPM')
+            previous_preference, _ = load_preference()
+            fans = Hardware().seed_individual(previous_preference, fan_index, fan_rpm)
+            preference = {'schema_version': 2, 'mode': 'manual', 'control_mode': 'individual',
+                          'rpm': None, 'fans': fans, 'owner_uid': uid, 'generation': uuid.uuid4().hex}
+        else:
+            preference = {'schema_version': 2, 'mode': 'manual', 'control_mode': 'shared',
+                          'rpm': int(action), 'fans': [], 'owner_uid': uid, 'generation': uuid.uuid4().hex}
         apply_manual(preference, persist=True)
 
 
@@ -602,7 +730,7 @@ def reconcile():
                                thermal_paused=isinstance(exc, ThermalFault))
                 save(current)
         return
-    if state['generation'] != preference['generation'] or state['requested_rpm'] != preference['rpm']:
+    if not state_matches_preference(state, preference):
         if reset('Reconciling saved fan preference'):
             try:
                 apply_manual(preference)
@@ -612,6 +740,17 @@ def reconcile():
     try:
         hardware = Hardware()
         hardware.check_temperatures()
+        planned = (hardware.planned_targets(fans=preference['fans'])
+                   if preference['control_mode'] == 'individual' else hardware.planned_targets(rpm=preference['rpm']))
+        if {item['index']: item['target'] for item in planned} != {item['index']: item['target'] for item in state['targets']}:
+            # The durable request remains authoritative if a hardware limit
+            # changes. Re-clamp transactionally; never retain an out-of-range
+            # cached target or rewrite the user's saved RPM preference.
+            try:
+                apply_manual(preference)
+            except RuntimeError:
+                pass
+            return
         observed = hardware.observed_targets()
         if not hardware.matches(state['targets'], observed):
             diagnostic = hardware.target_diagnostic(state['targets'], observed)
@@ -681,10 +820,16 @@ def watchdog():
 def main():
     os.umask(0o022)
     if len(sys.argv) < 2:
-        raise RuntimeError('Usage: apple-silicon-fan-control <auto|status|heartbeat TOKEN|RPM>')
+        raise RuntimeError('Usage: apple-silicon-fan-control <auto|status|heartbeat TOKEN|RPM|fan INDEX RPM>')
     action = sys.argv[1]
     generation = None
-    if action == 'heartbeat':
+    fan_index = fan_rpm = None
+    if action == 'fan':
+        if (len(sys.argv) != 4 or not re.fullmatch(r'[1-9]|[1-5][0-9]|6[0-4]', sys.argv[2])
+                or not re.fullmatch(r'[1-7][0-9]{3}', sys.argv[3])):
+            raise RuntimeError('Fan requires an index from 1 to 64 and a four-digit RPM from 1000 to 7999')
+        fan_index, fan_rpm = int(sys.argv[2]), int(sys.argv[3])
+    elif action == 'heartbeat':
         if len(sys.argv) != 3 or not re.fullmatch(r'[0-9a-f]{32}', sys.argv[2]):
             raise RuntimeError('Heartbeat requires the current 32-character lease generation')
         generation = sys.argv[2]
@@ -698,7 +843,7 @@ def main():
     if action == 'watchdog':
         watchdog()
     else:
-        command(action, generation)
+        command(action, generation, fan_index, fan_rpm)
         print(json.dumps(status(), allow_nan=False, separators=(',', ':')))
 
 

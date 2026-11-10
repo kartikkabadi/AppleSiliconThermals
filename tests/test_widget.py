@@ -51,17 +51,22 @@ class WidgetIntegrationTests(unittest.TestCase):
 
     def test_telemetry_command_queue_and_saved_intent(self):
         actions = self.run_widget('smoke.qml').splitlines()
-        self.assertEqual(actions[:2], ['set 4000', 'set auto'])
-        self.assertNotIn('set 4500', actions)
-        self.assertNotIn('set 5000', actions)
-        self.assertIn('set 4999', actions)
+        self.assertEqual(actions[:2], ['set-fan 1 4000', 'set auto'])
+        self.assertEqual(actions.count('set-fan 2 3000'), 0)
+        self.assertNotIn('set-fan 2 5000', actions)
+        self.assertEqual(actions[2:5], ['set-fan 1 4000', 'set-fan 1 4500', 'set-fan 2 3500'])
+        self.assertIn('set-fan 1 5050', actions)
+        self.assertFalse(any('set-fan 64 ' in action for action in actions))
 
     def test_saved_manual_choice_survives_widget_recreation_without_heartbeat(self):
         actions = self.run_widget('restart.qml').splitlines()
-        self.assertEqual(actions, ['set 4000'])
+        self.assertEqual(actions, ['set-fan 1 4000', 'set-fan 2 3000'])
 
     def test_missing_executable_recovers_after_install(self):
         self.run_widget('recovery.qml', delayed_helper=True)
+
+    def test_sensor_refresh_does_not_recreate_interactive_fan_cards(self):
+        self.run_widget('stable-cards.qml')
 
 
 if __name__ == '__main__':

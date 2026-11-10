@@ -22,6 +22,7 @@ loader = importlib.machinery.SourceFileLoader('broker_review', str(ROOT / 'syste
 spec = importlib.util.spec_from_loader(loader.name, loader)
 broker = importlib.util.module_from_spec(spec)
 loader.exec_module(broker)
+PRODUCTION_HARDWARE = broker.Hardware
 
 
 class OperatingSystemBoundaryTests(unittest.TestCase):
@@ -154,6 +155,7 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         self.hardware = mock.Mock()
         self.hardware.automatic.side_effect = self.automatic
         self.hardware.manual.side_effect = self.manual
+        self.hardware.planned_targets.side_effect = self.planned_targets
         self.hardware.reacquire.side_effect = self.reacquire
         self.hardware.check_temperatures.side_effect = self.check_temperatures
         self.hardware.observed_targets.side_effect = lambda: copy.deepcopy(self.observed)
@@ -176,7 +178,8 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         broker.save_preference(self.preference)
         state = broker.state_default()
         state.update(mode='manual', owner_uid=1000, generation='a' * 32,
-                     requested_rpm=4000, targets=copy.deepcopy(self.observed))
+                     requested_rpm=4000, targets=copy.deepcopy(self.observed),
+                     control_mode='shared', requested_fans=[])
         broker.save(state)
         broker.atomic_json(self.runtime / 'watchdog.json', {'boot_id': self.current_boot, 'updated_at': self.now})
 
@@ -195,6 +198,11 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         self.events.append(('manual', rpm))
         return copy.deepcopy(self.observed)
 
+    def planned_targets(self, rpm=None, fans=None):
+        requested = {item['index']: item['rpm'] for item in fans} if fans is not None else {1: rpm, 2: rpm}
+        return [{'index': index, 'target': min(maximum, max(1200, requested[index]))}
+                for index, maximum in ((1, 5779), (2, 6241))]
+
     def reacquire(self, targets):
         self.events.append(('repair', copy.deepcopy(targets)))
         self.observed = copy.deepcopy(targets)
@@ -205,6 +213,42 @@ class PersistentIntentSafetyTests(unittest.TestCase):
 
     def profile_bytes(self):
         return (self.persistence / 'preference.json').read_bytes()
+
+    def use_real_fixture_hardware(self):
+        """Keep real planning/readback logic, redirect only physical writes."""
+        self.hw = self.root / 'sys/devices/macsmc/hwmon/hwmon3'
+        self.hw.mkdir(parents=True)
+        links = self.root / 'sys/class/hwmon'
+        links.mkdir(parents=True)
+        (links / 'hwmon3').symlink_to(self.hw)
+        parameter = self.root / 'sys/module/macsmc_hwmon/parameters/fan_control'
+        parameter.parent.mkdir(parents=True)
+        parameter.write_text('Y\n')
+        (self.hw / 'name').write_text('macsmc_hwmon\n')
+        (self.hw / 'temp1_input').write_text('45000\n')
+        for index, maximum in ((1, 5779), (2, 6241)):
+            for suffix, value in (('min', 1200), ('max', maximum), ('target', 4000), ('input', 4000)):
+                (self.hw / f'fan{index}_{suffix}').write_text(str(value))
+        self.real_writes = []
+        def fixture_write(hardware, path, value):
+            self.assertTrue(path.resolve().is_relative_to(self.hw))
+            self.real_writes.append((path.name, value))
+            path.write_text(str(value))
+        for name, value in (('SYSFS', self.root / 'sys'), ('Hardware', PRODUCTION_HARDWARE)):
+            patcher = mock.patch.object(broker, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(PRODUCTION_HARDWARE, 'write', fixture_write)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(broker, 'time', mock.Mock(sleep=lambda _seconds: None))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def individual_preference(self, first=1600, second=5000):
+        return {'schema_version': 2, 'mode': 'manual', 'control_mode': 'individual',
+                'rpm': None, 'fans': [{'index': 1, 'rpm': first}, {'index': 2, 'rpm': second}],
+                'owner_uid': 1000, 'generation': 'b' * 32}
 
     def test_fresh_boot_empty_runtime_restores_saved_manual_without_ui(self):
         before = self.profile_bytes()
@@ -395,6 +439,109 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         self.assertEqual(state['generation'], 'a' * 32)
         self.assertEqual(state['requested_rpm'], 4000)
         self.assertEqual(self.profile_bytes(), before)
+
+    def test_fresh_boot_restores_unequal_individual_targets_by_index(self):
+        self.use_real_fixture_hardware()
+        preference = self.individual_preference()
+        preference['fans'].reverse()  # Persisted map order is not channel identity.
+        broker.save_preference(preference)
+        before = self.profile_bytes()
+        for path in self.runtime.iterdir():
+            path.unlink()
+        self.current_boot = 'boot-B'
+        self.now = 0
+        broker.reset()
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'manual')
+        self.assertEqual((self.hw / 'fan1_target').read_text(), '1600')
+        self.assertEqual((self.hw / 'fan2_target').read_text(), '5000')
+        self.assertEqual(self.profile_bytes(), before)
+
+    def test_two_rapid_independent_commands_preserve_both_updates(self):
+        self.use_real_fixture_hardware()
+        mutex = threading.Lock()
+        barrier = threading.Barrier(2)
+        failures = []
+        original_load = broker.load_preference
+        def delayed_load():
+            value = original_load()
+            time.sleep(0.01)  # Exposes lost-update bugs if read leaves the lock.
+            return value
+        def edit(index, rpm):
+            try:
+                barrier.wait(timeout=2)
+                broker.command('fan', fan_index=index, fan_rpm=rpm)
+            except Exception as error:
+                failures.append(error)
+        with mock.patch.object(broker, 'locked', lambda: mutex), \
+                mock.patch.object(broker, 'owner_uid', return_value=1000), \
+                mock.patch.object(broker, 'load_preference', delayed_load):
+            threads = [threading.Thread(target=edit, args=(1, 1600), daemon=True),
+                       threading.Thread(target=edit, args=(2, 5000), daemon=True)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertFalse(failures, repr(failures))
+        preference, error = broker.load_preference()
+        self.assertIsNone(error)
+        self.assertEqual(preference['fans'], [{'index': 1, 'rpm': 1600}, {'index': 2, 'rpm': 5000}])
+        self.assertEqual((self.hw / 'fan1_target').read_text(), '1600')
+        self.assertEqual((self.hw / 'fan2_target').read_text(), '5000')
+
+    def test_editing_one_healthy_manual_fan_does_not_write_the_other(self):
+        self.use_real_fixture_hardware()
+        with mock.patch.object(broker, 'owner_uid', return_value=1000):
+            broker.command('fan', fan_index=1, fan_rpm=1600)
+        self.assertEqual(broker.load_preference()[0]['fans'], [{'index': 1, 'rpm': 1600}, {'index': 2, 'rpm': 4000}])
+        self.assertFalse(any(name == 'fan2_target' for name, _value in self.real_writes))
+
+    def test_changed_hardware_bounds_clamp_actual_targets_without_rewriting_desired_map(self):
+        self.use_real_fixture_hardware()
+        broker.save_preference(self.individual_preference(first=6241, second=6500))
+        before = self.profile_bytes()
+        (self.hw / 'fan2_max').write_text('5000')
+        broker.reset()
+        broker.watchdog_tick()
+        self.assertEqual((self.hw / 'fan1_target').read_text(), '5779')
+        self.assertEqual((self.hw / 'fan2_target').read_text(), '5000')
+        self.assertEqual(self.profile_bytes(), before)
+
+    def test_live_hardware_limit_drop_cannot_keep_a_target_above_the_new_maximum(self):
+        self.use_real_fixture_hardware()
+        broker.apply_manual(self.individual_preference(), persist=True)
+        before = self.profile_bytes()
+        (self.hw / 'fan2_max').write_text('4000')
+        broker.watchdog_tick()
+        self.assertLessEqual(int((self.hw / 'fan2_target').read_text()), 4000)
+        self.assertEqual(self.profile_bytes(), before)
+
+    def test_new_or_missing_channel_pauses_individual_map_without_index_reinterpretation(self):
+        self.use_real_fixture_hardware()
+        broker.save_preference(self.individual_preference())
+        before = self.profile_bytes()
+        for suffix in ('min', 'max', 'target', 'input'):
+            (self.hw / f'fan2_{suffix}').rename(self.hw / f'fan3_{suffix}')
+        broker.reset()
+        broker.watchdog_tick()
+        self.assertEqual(broker.load_state()['mode'], 'auto')
+        self.assertEqual((self.hw / 'fan3_target').read_text(), '0')
+        self.assertEqual(self.profile_bytes(), before)
+        self.assertIn('inventory', broker.load_state()['error'])
+
+    def test_schema1_reads_migrate_without_modifying_the_legacy_file(self):
+        import json
+        path = self.persistence / 'preference.json'
+        path.write_text(json.dumps(self.preference))
+        before = path.read_bytes()
+        preference, error = broker.load_preference()
+        self.assertIsNone(error)
+        self.assertEqual(preference['schema_version'], 2)
+        self.assertEqual(preference['control_mode'], 'shared')
+        self.assertEqual(preference['rpm'], 4000)
+        self.assertEqual(preference['fans'], [])
+        self.assertEqual(path.read_bytes(), before)
 
 
 if __name__ == '__main__':

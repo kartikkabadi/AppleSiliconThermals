@@ -47,7 +47,7 @@
   "powerLabel": "System power",
   "coolingLabel": "Cooling control",
   "manualButton": "Manual",
-  "targetLabel": "Target speed",
+  "targetLabel": "Target",
   "targetBoth": "Both fans · target speed",
   "targetAll": "All fans · target speed",
   "ofMaximum": "%1% of maximum",
@@ -62,5 +62,8 @@
   "nandLabel": "NAND flash",
   "batteryLabel": "Battery hotspot",
   "regulatorLabel": "Charge regulator",
-  "wifiLabel": "Wi-Fi / Bluetooth"
+  "wifiLabel": "Wi-Fi / Bluetooth",
+  "minShort": "Min",
+  "maxShort": "Max",
+  "rememberedIndependent": "Each fan’s speed is remembered across restarts"
 }

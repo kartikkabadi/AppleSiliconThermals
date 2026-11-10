@@ -14,6 +14,23 @@ import time
 
 BROKER = Path('/usr/local/libexec/apple-silicon-fan-control')
 ACTION = re.compile(r'(?:auto|[1-7][0-9]{3})\Z')
+FAN_INDEX = re.compile(r'(?:[1-9]|[1-5][0-9]|6[0-4])\Z')
+
+
+def saved_fan_map(value) -> list[dict] | None:
+    if not isinstance(value, list) or len(value) > 64:
+        return None
+    result = []
+    indices = set()
+    for fan in value:
+        if (not isinstance(fan, dict) or set(fan) != {'index', 'rpm'}
+                or type(fan['index']) is not int or not 1 <= fan['index'] <= 64
+                or fan['index'] in indices or type(fan['rpm']) is not int
+                or not 1000 <= fan['rpm'] <= 7999):
+            return None
+        indices.add(fan['index'])
+        result.append({'index': fan['index'], 'rpm': fan['rpm']})
+    return sorted(result, key=lambda fan: fan['index'])
 
 
 def read_text(path: Path) -> str | None:
@@ -100,12 +117,32 @@ def broker_status() -> dict:
             env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         permitted = False
+    per_fan_permitted = False
+    if permitted and data.get('per_fan_control') is True:
+        # Detect partial upgrades: an older policy can grant Auto/shared RPM
+        # while lacking the new fan action. Probe without executing anything.
+        targets = data.get('targets')
+        indices = [fan['index'] for fan in targets[:64]
+                   if isinstance(fan, dict) and type(fan.get('index')) is int
+                   and 1 <= fan['index'] <= 64] if isinstance(targets, list) else []
+        index = min(indices) if indices else 1
+        try:
+            per_fan_permitted = subprocess.run(
+                ['/usr/bin/sudo', '-n', '-l', str(BROKER), 'fan', str(index), '1000'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=1, check=False,
+                env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     error = data.get('error')
     if not ready and not error:
         error = 'Manual-control watchdog is not ready.'
     if ready and not permitted:
         error = 'This user is not authorized for manual control.'
+    elif ready and data.get('per_fan_control') is True and not per_fan_permitted:
+        error = 'Per-fan permission is not installed. Update the control service setup.'
     return {**data, 'mode': mode if ready else 'unknown', 'ready': ready,
+            'per_fan_control': per_fan_permitted,
             'permitted': permitted, 'error': str(error)[:1024] if error else None}
 
 
@@ -147,6 +184,17 @@ class Telemetry:
         saved_owner = control.get('saved_owner_uid')
         if type(saved_owner) is not int or saved_owner < 0:
             saved_owner = None
+        saved_control_mode = control.get('saved_control_mode')
+        if saved_control_mode not in ('auto', 'shared', 'individual'):
+            saved_control_mode = 'unknown'
+        control_mode = control.get('control_mode')
+        if control_mode not in ('auto', 'shared', 'individual'):
+            control_mode = 'unknown'
+        saved_fans = saved_fan_map(control.get('saved_fans', []))
+        preference_error = str(control['preference_error'])[:1024] if control.get('preference_error') else None
+        if saved_fans is None:
+            saved_fans = []
+            preference_error = preference_error or 'Control service returned an invalid saved fan map.'
         paused = None
         if persistent and saved_mode == 'manual' and mode != 'manual':
             paused = control.get('paused_reason') or control.get('pause_reason') or control.get('error')
@@ -158,9 +206,12 @@ class Telemetry:
             'fan_min': None, 'fan_max': None, 'fan_target': None,
             'mode': mode, 'manual_mode': mode == 'manual',
             'persistent': persistent, 'saved_mode': saved_mode, 'saved_rpm': saved_rpm,
+            'per_fan_control': control.get('per_fan_control') is True and preference_error is None,
+            'saved_fans': saved_fans, 'saved_control_mode': saved_control_mode,
+            'control_mode': control_mode,
             'saved_owner_uid': saved_owner, 'requested_rpm': requested_rpm,
             'paused_reason': paused,
-            'preference_error': str(control['preference_error'])[:1024] if control.get('preference_error') else None,
+            'preference_error': preference_error,
             'control_available': available, 'fan_control_enabled': False,
             'lease_owned': (mode == 'manual' or control.get('recovering') is True) and control.get('owner_uid') == os.getuid(),
             'lease_recovering': control.get('recovering') is True,
@@ -240,19 +291,21 @@ def main(argv: list[str]) -> int:
         print(json.dumps(Telemetry().get(broker_status()), ensure_ascii=True, allow_nan=False, separators=(',', ':')))
         return 0
     is_set = len(argv) == 2 and argv[0] == 'set' and ACTION.fullmatch(argv[1])
+    is_set_fan = (len(argv) == 3 and argv[0] == 'set-fan' and FAN_INDEX.fullmatch(argv[1])
+                  and re.fullmatch(r'[1-7][0-9]{3}', argv[2]))
     is_heartbeat = len(argv) == 2 and argv[0] == 'heartbeat' and re.fullmatch(r'[0-9a-f]{32}', argv[1])
-    if is_set or is_heartbeat:
+    if is_set or is_set_fan or is_heartbeat:
         if not trusted_broker():
             print(json.dumps({'ok': False, 'error': 'The trusted manual-control service is not installed.'}))
             return 1
-        arguments = [argv[1]] if is_set else ['heartbeat', argv[1]]
+        arguments = [argv[1]] if is_set else ['fan', argv[1], argv[2]] if is_set_fan else ['heartbeat', argv[1]]
         response = command_result(['/usr/bin/sudo', '-n', str(BROKER), *arguments], 3.5)
         if response['ok']:
             print(json.dumps(response['data'], allow_nan=False))
             return 0
         print(json.dumps({'ok': False, 'error': response['error']}, ensure_ascii=True))
         return 1
-    print(json.dumps({'ok': False, 'error': 'Usage: helper.sh get | set <auto|4-digit RPM> | heartbeat <lease-id>'}))
+    print(json.dumps({'ok': False, 'error': 'Usage: helper.sh get | set <auto|RPM> | set-fan <index> <RPM> | heartbeat <lease-id>'}))
     return 64
 
 

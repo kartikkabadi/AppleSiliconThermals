@@ -9,6 +9,7 @@ Scope {
         onTriggered: {
             widget.controlAvailable = true
             widget.fanControlEnabled = true
+            widget.perFanControl = true
             widget.dataValid = true
             widget.setSpeed("4000")
         }

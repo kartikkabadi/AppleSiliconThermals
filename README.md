@@ -54,7 +54,10 @@ omarchy plugin enable io.github.lukasmoriarty.applesiliconthermals --section rig
 Do not install both upstream and this fork: the plugin ID is intentionally the
 same so an existing installation can be upgraded. Back up the existing checkout
 and `~/.config/omarchy/shell.json` before replacing it. The shell hot-reloads
-plugin files. An existing legacy root helper must be upgraded separately using
+plugin files. When upgrading from 2.0 to 2.1, run `omarchy restart shell` once
+after updating: Quickshell can retain older compiled widget components during
+a hot update that adds new QML types. The persistent control service keeps the
+saved fan setting independently of that restart. An existing legacy root helper must be upgraded separately using
 the optional setup below; installing the bar widget does not execute root code.
 
 Use the popup to view each fan's actual speed, target and hardware limits.

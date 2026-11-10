@@ -22,7 +22,7 @@ BorderSurface {
         ThermalText { width: parent.width; text: card.iconText + "  " + card.labelText; color: Commons.Color.muted }
         Row {
             spacing: Style.space(5)
-            ThermalText { text: card.valueText; color: card.valueColor; font.pixelSize: Style.font.title; font.bold: true }
+            ThermalText { text: card.valueText; color: card.valueColor; font.pixelSize: Math.max(Style.font.title, Style.space(20)); font.bold: true }
             ThermalText { text: card.unitText; color: Commons.Color.muted; anchors.bottom: parent.bottom; anchors.bottomMargin: Style.space(3) }
         }
     }

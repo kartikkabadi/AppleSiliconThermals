@@ -28,7 +28,7 @@ BorderSurface {
         }
         Row {
             spacing: Style.space(5)
-            ThermalText { text: card.speedText; font.pixelSize: Style.font.title; font.bold: true }
+            ThermalText { text: card.speedText; font.pixelSize: Math.max(Style.font.title, Style.space(22)); font.bold: true }
             ThermalText { text: "RPM"; color: Commons.Color.muted; anchors.bottom: parent.bottom; anchors.bottomMargin: Style.space(3) }
         }
         Rectangle {

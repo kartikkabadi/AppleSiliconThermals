@@ -410,7 +410,7 @@ BarWidget {
                                     ThermalText { text: strings.t(root.fanCount === 2 ? "targetBoth" : root.fanCount > 2 ? "targetAll" : "targetLabel"); color: Commons.Color.muted }
                                     Row {
                                         spacing: Style.space(5)
-                                        ThermalText { text: root.formatRpm(root.snapSpeed(rpmSlider.liveValue)); font.pixelSize: Style.font.title; font.bold: true; color: Commons.Color.accent }
+                                        ThermalText { text: root.formatRpm(root.snapSpeed(rpmSlider.liveValue)); font.pixelSize: Math.max(Style.font.title, Style.space(28)); font.bold: true; color: Commons.Color.accent }
                                         ThermalText { text: "RPM"; color: Commons.Color.muted; anchors.bottom: parent.bottom; anchors.bottomMargin: Style.space(3) }
                                     }
                                 }

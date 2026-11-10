@@ -188,8 +188,9 @@ malformed data and markup neutralization. CI runs these on Ubuntu 22.04/24.04.
 The same Python command also runs two headless QML integration tests when
 Omarchy UI modules and Quickshell are installed; otherwise those two tests skip.
 
-Actual manual writes, lease expiry and suspend/resume are separate hardware
-checks. Passing fixtures or a read-only smoke test is not proof that every Mac,
+See [VALIDATION.md](VALIDATION.md) for completed physical checks on the M1 Pro,
+including maximum writes, lease expiry and watchdog crash recovery. Real
+suspend/resume and other models remain separate hardware checks. Passing fixtures or a read-only smoke test is not proof that every Mac,
 kernel and desktop configuration works. Report the model, kernel, Omarchy/Qt
 versions, broker status and relevant service logs when filing an issue; do not
 include credentials or private environment dumps.

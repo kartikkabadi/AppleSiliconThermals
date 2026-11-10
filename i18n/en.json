@@ -71,5 +71,6 @@
   "separate": "Separate",
   "linkedNote": "One target controls all fans. Each fan stays within its own hardware limits.",
   "separateMemoryMismatch": "The remembered separate profile does not match these fans. Linked control remains available.",
-  "separateMemoryUnsupported": "Update the control service to remember separate speeds while using Linked control."
+  "separateMemoryUnsupported": "Update the control service to remember separate speeds while using Linked control.",
+  "linkedMemoryUnsupported": "Update the control service to remember Linked speed independently of Separate controls."
 }

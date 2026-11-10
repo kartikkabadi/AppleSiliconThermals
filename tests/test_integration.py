@@ -564,6 +564,7 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         preference, error = broker.load_preference()
         self.assertIsNone(error)
         self.assertEqual(preference['separate_fans'], memory)
+        self.assertEqual(preference['linked_rpm'], 4500)
         if preference['control_mode'] == 'individual':
             self.assertEqual(preference['fans'], memory)
             self.assertEqual((self.hw / 'fan1_target').read_text(), '1600')
@@ -574,6 +575,32 @@ class PersistentIntentSafetyTests(unittest.TestCase):
             self.assertEqual((self.hw / 'fan1_target').read_text(), '4500')
             self.assertEqual((self.hw / 'fan2_target').read_text(), '4500')
 
+    def test_cold_boot_separate_keeps_lower_linked_bank_for_exact_later_restore(self):
+        self.use_real_fixture_hardware()
+        with mock.patch.object(broker, 'owner_uid', return_value=1000):
+            broker.command('2000')
+            broker.command('separate')
+            broker.command('fan', fan_index=1, fan_rpm=3500)
+            broker.command('fan', fan_index=2, fan_rpm=5000)
+        before = self.profile_bytes()
+        for path in self.runtime.iterdir():
+            path.unlink()
+        self.current_boot = 'two-bank-cold-boot'
+        self.now = 0
+        broker.reset()
+        broker.watchdog_tick()
+        self.assertEqual((self.hw / 'fan1_target').read_text(), '3500')
+        self.assertEqual((self.hw / 'fan2_target').read_text(), '5000')
+        self.assertEqual(self.profile_bytes(), before)
+        with mock.patch.object(broker, 'owner_uid', return_value=1000):
+            broker.command('linked')
+        self.assertEqual((self.hw / 'fan1_target').read_text(), '2000')
+        self.assertEqual((self.hw / 'fan2_target').read_text(), '2000')
+        preference, error = broker.load_preference()
+        self.assertIsNone(error)
+        self.assertEqual(preference['linked_rpm'], 2000)
+        self.assertEqual(preference['separate_fans'], [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 5000}])
+
     def test_schema1_reads_migrate_without_modifying_the_legacy_file(self):
         import json
         path = self.persistence / 'preference.json'
@@ -581,7 +608,7 @@ class PersistentIntentSafetyTests(unittest.TestCase):
         before = path.read_bytes()
         preference, error = broker.load_preference()
         self.assertIsNone(error)
-        self.assertEqual(preference['schema_version'], 3)
+        self.assertEqual(preference['schema_version'], 4)
         self.assertEqual(preference['control_mode'], 'shared')
         self.assertEqual(preference['rpm'], 4000)
         self.assertEqual(preference['fans'], [])

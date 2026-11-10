@@ -262,6 +262,29 @@ class Hardware:
         self.reacquire(targets, changed_indices=changed_indices)
         return targets
 
+    def seed_linked(self, preference):
+        # This fallback is used only before the first Linked setting is saved.
+        # Never lower a currently applied/planned channel merely to enter it.
+        self.planned_targets(rpm=1000)
+        observed = {item['index']: item['target'] for item in self.observed_targets()}
+        values = []
+        for index, path in self.fans:
+            minimum, maximum = self.bounds(path)
+            values.append(min(maximum, max(minimum, observed[index])))
+        applicable_plan = (preference['control_mode'] != 'individual'
+                           or {item['index'] for item in preference['fans']} == {index for index, _ in self.fans})
+        if preference['mode'] == 'manual' and applicable_plan:
+            planned = (self.planned_targets(fans=preference['fans'])
+                       if preference['control_mode'] == 'individual'
+                       else self.planned_targets(rpm=preference['rpm']))
+            values.extend(item['target'] for item in planned)
+        maximum = max(values)
+        candidate = max(1000, maximum)
+        if candidate > 7999:
+            raise RuntimeError('Current fan targets cannot be represented safely by Linked; choose an explicit shared RPM first')
+        self.planned_targets(rpm=candidate)
+        return candidate
+
     def seed_separate(self):
         # With no remembered profile, snapshot the currently applied setpoints.
         # Inventory, bounds and representability are validated before writes.
@@ -379,14 +402,16 @@ def validate_fans(fans, allow_empty=False):
 
 
 def preference_default():
-    return {'schema_version': 3, 'mode': 'auto', 'control_mode': 'auto',
-            'rpm': None, 'fans': [], 'separate_fans': [], 'owner_uid': None, 'generation': '0' * 32}
+    return {'schema_version': 4, 'mode': 'auto', 'control_mode': 'auto',
+            'rpm': None, 'fans': [], 'separate_fans': [], 'linked_rpm': None,
+            'owner_uid': None, 'generation': '0' * 32}
 
 
 def validate_preference(value):
     old_fields = {'schema_version', 'mode', 'rpm', 'owner_uid', 'generation'}
     second_fields = old_fields | {'control_mode', 'fans'}
-    current_fields = second_fields | {'separate_fans'}
+    third_fields = second_fields | {'separate_fans'}
+    current_fields = third_fields | {'linked_rpm'}
     if not isinstance(value, dict) or type(value.get('schema_version')) is not int:
         raise RuntimeError('Invalid saved fan preference schema')
     version = value['schema_version']
@@ -399,12 +424,18 @@ def validate_preference(value):
         # previously active individual map is also the remembered profile.
         memory = value['fans'] if value['mode'] == 'manual' and value['control_mode'] == 'individual' else []
         value = {**value, 'schema_version': 3, 'separate_fans': memory}
-    elif version != 3 or set(value) != current_fields:
+        version = 3
+    if version == 3 and set(value) == third_fields:
+        linked = value['rpm'] if value['mode'] == 'manual' and value['control_mode'] == 'shared' else None
+        value = {**value, 'schema_version': 4, 'linked_rpm': linked}
+    elif version != 4 or set(value) != current_fields:
         raise RuntimeError('Invalid saved fan preference schema')
     if (value['mode'] not in ('auto', 'manual')
             or not isinstance(value['generation'], str)
             or not re.fullmatch(r'[0-9a-f]{32}', value['generation'])):
         raise RuntimeError('Invalid saved fan preference schema')
+    if value['linked_rpm'] is not None and (type(value['linked_rpm']) is not int or not 1000 <= value['linked_rpm'] <= 7999):
+        raise RuntimeError('Invalid remembered Linked RPM')
     value = {**value, 'separate_fans': validate_fans(value['separate_fans'], allow_empty=True)}
     if value['mode'] == 'auto':
         if (value['control_mode'] != 'auto' or value['rpm'] is not None
@@ -416,6 +447,8 @@ def validate_preference(value):
         if value['control_mode'] == 'shared':
             if type(value['rpm']) is not int or not 1000 <= value['rpm'] <= 7999 or value['fans'] != []:
                 raise RuntimeError('Invalid saved shared RPM')
+            if value['linked_rpm'] != value['rpm']:
+                raise RuntimeError('Active Shared RPM must match the remembered Linked RPM')
         elif value['control_mode'] == 'individual':
             if value['rpm'] is not None:
                 raise RuntimeError('Individual preference must not contain a shared RPM')
@@ -529,7 +562,8 @@ def watchdog_ready():
 
 def status():
     preference, preference_error = load_preference()
-    saved = {'persistent': True, 'per_fan_control': True, 'separate_memory': True,
+    saved = {'persistent': True, 'per_fan_control': True, 'separate_memory': True, 'linked_memory': True,
+             'saved_linked_rpm': preference['linked_rpm'],
              'saved_separate_fans': preference['separate_fans'], 'saved_mode': preference['mode'],
              'saved_control_mode': preference['control_mode'], 'saved_fans': preference['fans'],
              'requested_fans': preference['fans'],
@@ -659,6 +693,7 @@ def command(action, generation=None, fan_index=None, fan_rpm=None):
                     preference = preference_default()
                     if previous_error is None:
                         preference['separate_fans'] = previous_preference['separate_fans']
+                        preference['linked_rpm'] = previous_preference['linked_rpm']
                     preference['generation'] = uuid.uuid4().hex
                     save_preference(preference)
                 except (OSError, ValueError, RuntimeError) as exc:
@@ -699,7 +734,16 @@ def command(action, generation=None, fan_index=None, fan_rpm=None):
         if state['mode'] == 'manual' and state['owner_uid'] != uid:
             raise RuntimeError('Another user owns the manual setting; select Auto first')
         previous_preference, _ = load_preference()
-        if action == 'separate':
+        if action == 'linked':
+            hardware = Hardware()
+            linked = previous_preference['linked_rpm']
+            if linked is None:
+                linked = hardware.seed_linked(previous_preference)
+            hardware.planned_targets(rpm=linked)
+            preference = {'schema_version': 4, 'mode': 'manual', 'control_mode': 'shared',
+                          'rpm': linked, 'fans': [], 'separate_fans': previous_preference['separate_fans'],
+                          'linked_rpm': linked, 'owner_uid': uid, 'generation': uuid.uuid4().hex}
+        elif action == 'separate':
             hardware = Hardware()
             fans = previous_preference['separate_fans']
             if fans:
@@ -711,20 +755,22 @@ def command(action, generation=None, fan_index=None, fan_rpm=None):
                     raise RuntimeError('Remembered separate profile cannot be restored: ' + str(exc)) from exc
             else:
                 fans = hardware.seed_separate()
-            preference = {'schema_version': 3, 'mode': 'manual', 'control_mode': 'individual',
+            preference = {'schema_version': 4, 'mode': 'manual', 'control_mode': 'individual',
                           'rpm': None, 'fans': fans, 'separate_fans': fans,
+                          'linked_rpm': previous_preference['linked_rpm'],
                           'owner_uid': uid, 'generation': uuid.uuid4().hex}
         elif action == 'fan':
             if type(fan_index) is not int or not 1 <= fan_index <= 64 or type(fan_rpm) is not int or not 1000 <= fan_rpm <= 7999:
                 raise RuntimeError('Invalid fan index or RPM')
             fans = Hardware().seed_individual(previous_preference, fan_index, fan_rpm)
-            preference = {'schema_version': 3, 'mode': 'manual', 'control_mode': 'individual',
+            preference = {'schema_version': 4, 'mode': 'manual', 'control_mode': 'individual',
                           'rpm': None, 'fans': fans, 'separate_fans': fans,
+                          'linked_rpm': previous_preference['linked_rpm'],
                           'owner_uid': uid, 'generation': uuid.uuid4().hex}
         else:
-            preference = {'schema_version': 3, 'mode': 'manual', 'control_mode': 'shared',
+            preference = {'schema_version': 4, 'mode': 'manual', 'control_mode': 'shared',
                           'rpm': int(action), 'fans': [], 'separate_fans': previous_preference['separate_fans'],
-                          'owner_uid': uid, 'generation': uuid.uuid4().hex}
+                          'linked_rpm': int(action), 'owner_uid': uid, 'generation': uuid.uuid4().hex}
         apply_manual(preference, persist=True)
 
 
@@ -865,7 +911,7 @@ def watchdog():
 def main():
     os.umask(0o022)
     if len(sys.argv) < 2:
-        raise RuntimeError('Usage: apple-silicon-fan-control <auto|separate|status|heartbeat TOKEN|RPM|fan INDEX RPM>')
+        raise RuntimeError('Usage: apple-silicon-fan-control <auto|linked|separate|status|heartbeat TOKEN|RPM|fan INDEX RPM>')
     action = sys.argv[1]
     generation = None
     fan_index = fan_rpm = None
@@ -878,7 +924,7 @@ def main():
         if len(sys.argv) != 3 or not re.fullmatch(r'[0-9a-f]{32}', sys.argv[2]):
             raise RuntimeError('Heartbeat requires the current 32-character lease generation')
         generation = sys.argv[2]
-    elif len(sys.argv) != 2 or not re.fullmatch(r'auto|separate|release|status|watchdog|sleep|resume|[1-7][0-9]{3}', action):
+    elif len(sys.argv) != 2 or not re.fullmatch(r'auto|linked|separate|release|status|watchdog|sleep|resume|[1-7][0-9]{3}', action):
         raise RuntimeError('Invalid fan broker action')
     if action == 'status':
         print(json.dumps(status(), allow_nan=False, separators=(',', ':')))

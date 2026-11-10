@@ -15,6 +15,7 @@ import time
 BROKER = Path('/usr/local/libexec/apple-silicon-fan-control')
 ACTION = re.compile(r'(?:auto|[1-7][0-9]{3})\Z')
 FAN_INDEX = re.compile(r'(?:[1-9]|[1-5][0-9]|6[0-4])\Z')
+PERMISSION_TIMEOUT = 0.6  # Four probes + status stay inside the widget read deadline.
 
 
 def saved_fan_map(value) -> list[dict] | None:
@@ -113,7 +114,7 @@ def broker_status() -> dict:
         permitted = subprocess.run(
             ['/usr/bin/sudo', '-n', '-l', str(BROKER), 'auto'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=1, check=False,
+            timeout=PERMISSION_TIMEOUT, check=False,
             env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         permitted = False
@@ -130,7 +131,7 @@ def broker_status() -> dict:
             per_fan_permitted = subprocess.run(
                 ['/usr/bin/sudo', '-n', '-l', str(BROKER), 'fan', str(index), '1000'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=1, check=False,
+                timeout=PERMISSION_TIMEOUT, check=False,
                 env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -140,11 +141,21 @@ def broker_status() -> dict:
             separate_permitted = subprocess.run(
                 ['/usr/bin/sudo', '-n', '-l', str(BROKER), 'separate'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=1, check=False,
+                timeout=PERMISSION_TIMEOUT, check=False,
                 env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             pass
     error = data.get('error')
+    linked_permitted = False
+    if permitted and data.get('linked_memory') is True:
+        try:
+            linked_permitted = subprocess.run(
+                ['/usr/bin/sudo', '-n', '-l', str(BROKER), 'linked'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=PERMISSION_TIMEOUT, check=False,
+                env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     if not ready and not error:
         error = 'Manual-control watchdog is not ready.'
     if ready and not permitted:
@@ -153,8 +164,11 @@ def broker_status() -> dict:
         error = 'Per-fan permission is not installed. Update the control service setup.'
     elif ready and data.get('separate_memory') is True and not separate_permitted:
         error = 'Separate-profile permission is not installed. Update the control service setup.'
+    elif ready and data.get('linked_memory') is True and not linked_permitted:
+        error = 'Linked-profile permission is not installed. Update the control service setup.'
     return {**data, 'mode': mode if ready else 'unknown', 'ready': ready,
-            'per_fan_control': per_fan_permitted and (data.get('separate_memory') is not True or separate_permitted),
+            'per_fan_control': per_fan_permitted and (data.get('separate_memory') is not True or separate_permitted)
+                and (data.get('linked_memory') is not True or linked_permitted),
             'permitted': permitted, 'error': str(error)[:1024] if error else None}
 
 
@@ -214,6 +228,15 @@ class Telemetry:
             preference_error = preference_error or 'Control service returned an invalid remembered separate profile.'
         if separate_memory and saved_mode == 'manual' and saved_control_mode == 'individual' and separate_fans != saved_fans:
             preference_error = preference_error or 'Active separate targets do not match the remembered separate profile.'
+        linked_memory = control.get('linked_memory') is True
+        linked_rpm = control.get('saved_linked_rpm') if linked_memory else None
+        if linked_memory and 'saved_linked_rpm' not in control:
+            preference_error = preference_error or 'Control service omitted the remembered linked speed.'
+        if linked_rpm is not None and (type(linked_rpm) is not int or not 1000 <= linked_rpm <= 7999):
+            linked_rpm = None
+            preference_error = preference_error or 'Control service returned an invalid remembered linked speed.'
+        if linked_memory and saved_mode == 'manual' and saved_control_mode == 'shared' and linked_rpm != saved_rpm:
+            preference_error = preference_error or 'Active linked speed does not match the remembered linked speed.'
         paused = None
         if persistent and saved_mode == 'manual' and mode != 'manual':
             paused = control.get('paused_reason') or control.get('pause_reason') or control.get('error')
@@ -228,6 +251,7 @@ class Telemetry:
             'per_fan_control': control.get('per_fan_control') is True and preference_error is None,
             'saved_fans': saved_fans, 'saved_control_mode': saved_control_mode,
             'separate_memory': separate_memory, 'saved_separate_fans': separate_fans,
+            'linked_memory': linked_memory, 'saved_linked_rpm': linked_rpm,
             'control_mode': control_mode,
             'saved_owner_uid': saved_owner, 'requested_rpm': requested_rpm,
             'paused_reason': paused,
@@ -314,12 +338,13 @@ def main(argv: list[str]) -> int:
     is_set_fan = (len(argv) == 3 and argv[0] == 'set-fan' and FAN_INDEX.fullmatch(argv[1])
                   and re.fullmatch(r'[1-7][0-9]{3}', argv[2]))
     is_set_separate = argv == ['set-separate']
+    is_set_linked = argv == ['set-linked']
     is_heartbeat = len(argv) == 2 and argv[0] == 'heartbeat' and re.fullmatch(r'[0-9a-f]{32}', argv[1])
-    if is_set or is_set_fan or is_set_separate or is_heartbeat:
+    if is_set or is_set_fan or is_set_separate or is_set_linked or is_heartbeat:
         if not trusted_broker():
             print(json.dumps({'ok': False, 'error': 'The trusted manual-control service is not installed.'}))
             return 1
-        arguments = (['separate'] if is_set_separate else [argv[1]] if is_set
+        arguments = (['linked'] if is_set_linked else ['separate'] if is_set_separate else [argv[1]] if is_set
                      else ['fan', argv[1], argv[2]] if is_set_fan else ['heartbeat', argv[1]])
         response = command_result(['/usr/bin/sudo', '-n', str(BROKER), *arguments], 3.5)
         if response['ok']:
@@ -327,7 +352,7 @@ def main(argv: list[str]) -> int:
             return 0
         print(json.dumps({'ok': False, 'error': response['error']}, ensure_ascii=True))
         return 1
-    print(json.dumps({'ok': False, 'error': 'Usage: helper.sh get | set <auto|RPM> | set-fan <index> <RPM> | set-separate | heartbeat <lease-id>'}))
+    print(json.dumps({'ok': False, 'error': 'Usage: helper.sh get | set <auto|RPM> | set-fan <index> <RPM> | set-separate | set-linked | heartbeat <lease-id>'}))
     return 64
 
 

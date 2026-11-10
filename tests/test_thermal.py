@@ -246,6 +246,48 @@ class TelemetryTests(unittest.TestCase):
             with self.subTest(argv=argv), patch('builtins.print'):
                 self.assertEqual(thermal.main(argv), 64)
 
+    def test_linked_profile_cli_uses_one_exact_broker_token(self):
+        with patch.object(thermal, 'trusted_broker', return_value=True), \
+                patch.object(thermal, 'command_result', return_value={'ok': True, 'data': {'mode': 'manual'}}) as run, \
+                patch('builtins.print'):
+            self.assertEqual(thermal.main(['set-linked']), 0)
+        self.assertEqual(run.call_args.args[0], ['/usr/bin/sudo', '-n', str(thermal.BROKER), 'linked'])
+        for argv in (['set-linked', 'extra'], ['set-linked', '3000'], ['set-linked;id'], ['set', 'linked']):
+            with self.subTest(argv=argv), patch('builtins.print'):
+                self.assertEqual(thermal.main(argv), 64)
+
+    def test_linked_memory_is_distinct_from_active_individual_targets(self):
+        self.fan()
+        self.fan(2, maximum=6241)
+        result = self.reader.get({**self.control('manual'), 'persistent': True, 'per_fan_control': True,
+                                  'linked_memory': True, 'saved_linked_rpm': 3000, 'saved_mode': 'manual',
+                                  'saved_control_mode': 'individual',
+                                  'saved_fans': [{'index': 1, 'rpm': 2300}, {'index': 2, 'rpm': 2502}]})
+        self.assertTrue(result['linked_memory'])
+        self.assertEqual(result['saved_linked_rpm'], 3000)
+        self.assertTrue(result['fan_control_enabled'])
+
+    def test_invalid_claimed_linked_memory_fails_numeric_closed(self):
+        self.fan()
+        for value in ('missing', 3000.5, True, '3000', 999, 8000, [], {}):
+            with self.subTest(value=value):
+                control = {**self.control('auto'), 'per_fan_control': True, 'linked_memory': True}
+                if value != 'missing':
+                    control['saved_linked_rpm'] = value
+                result = self.reader.get(control)
+                self.assertFalse(result['per_fan_control'])
+                self.assertFalse(result['fan_control_enabled'])
+                self.assertTrue(result['control_available'])
+                self.assertTrue(result['preference_error'])
+        self.assertIsNone(self.reader.get({**self.control('auto'), 'linked_memory': True, 'saved_linked_rpm': None})['preference_error'])
+
+    def test_active_shared_target_must_match_claimed_linked_bank(self):
+        self.fan()
+        result = self.reader.get({**self.control('manual'), 'linked_memory': True, 'saved_linked_rpm': 3000,
+                                  'saved_mode': 'manual', 'saved_control_mode': 'shared', 'saved_rpm': 4000})
+        self.assertFalse(result['fan_control_enabled'])
+        self.assertTrue(result['preference_error'])
+
     def test_separate_memory_is_bounded_and_independent_of_current_shared_target(self):
         self.fan()
         self.fan(2, maximum=6241)
@@ -358,6 +400,26 @@ class TelemetryTests(unittest.TestCase):
         self.assertFalse(result['per_fan_control'])
         self.assertIn('Separate-profile permission', result['error'])
         self.assertEqual(commands[-1], ['/usr/bin/sudo', '-n', '-l', str(thermal.BROKER), 'separate'])
+
+    def test_linked_permission_probe_timeout_is_bounded_and_preserves_auto(self):
+        commands = []
+        def check(command, **kwargs):
+            commands.append((command, kwargs['timeout']))
+            if command[-1] == 'linked':
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            return subprocess.CompletedProcess(command, 0)
+        reply = {'ok': True, 'data': {'schema_version': 1, 'mode': 'manual', 'ready': True,
+                                     'per_fan_control': True, 'separate_memory': True, 'linked_memory': True}}
+        with patch.object(thermal, 'trusted_broker', return_value=True), \
+                patch.object(thermal, 'command_result', return_value=reply), \
+                patch.object(thermal.subprocess, 'run', side_effect=check):
+            result = thermal.broker_status()
+        self.assertTrue(result['permitted'])
+        self.assertTrue(result['linked_memory'])
+        self.assertFalse(result['per_fan_control'])
+        self.assertIn('Linked-profile permission', result['error'])
+        self.assertEqual(commands[-1][0], ['/usr/bin/sudo', '-n', '-l', str(thermal.BROKER), 'linked'])
+        self.assertLess(1.5 + sum(timeout for _command, timeout in commands), 5)
 
 
 if __name__ == '__main__':

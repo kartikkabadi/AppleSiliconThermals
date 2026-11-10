@@ -64,13 +64,15 @@ class WidgetIntegrationTests(unittest.TestCase):
 
     def test_linked_separate_switches_are_durable_and_cancel_other_layout_edits(self):
         actions = self.run_widget('control-modes.qml').splitlines()
-        self.assertEqual(actions[:2], ['set 2500', 'set-separate'])
+        self.assertEqual(actions[:3], ['set-linked', 'set 3000', 'set-separate'])
         before_auto = actions[:actions.index('set auto')]
-        self.assertEqual(before_auto.count('set 2502'), 1)
+        self.assertEqual(before_auto.count('set 2502'), 0)
+        self.assertGreaterEqual(actions.count('set-linked'), 5)
         self.assertEqual(actions.count('set-fan 1 2502'), 0)
         self.assertGreaterEqual(actions.count('set-separate'), 4)
         self.assertNotIn('set-fan 2 1200', actions)
-        self.assertGreaterEqual(actions[:actions.index('set auto')].count('set 5000'), 2)
+        self.assertEqual(actions.count('set 5000'), 0)
+        self.assertIn('set 4200', before_auto)
         self.assertEqual(actions.count('set-fan 2 3500'), 1)
 
     def test_missing_executable_recovers_after_install(self):

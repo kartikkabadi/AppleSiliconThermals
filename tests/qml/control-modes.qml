@@ -35,11 +35,15 @@ Scope {
                 stage = 1
             } else if (stage === 1) {
                 check(widget.savedControlMode === "shared" && widget.savedRpm === 2500 && !widget.separateControls, "Manual starts one linked target")
+                widget.setSpeed(3000)
+                stage = 30
+            } else if (stage === 30) {
+                check(widget.savedLinkedRpm === 3000, "Linked has its own explicit saved speed")
                 widget.chooseControlMode("individual")
                 stage = 2
             } else if (stage === 2) {
                 check(widget.savedControlMode === "individual" && widget.separateControls, "Separate is explicit and durable")
-                check(widget.fanSelected(widget.fans[0]) === 2500 && widget.fanSelected(widget.fans[1]) === 2500, "Shared to Separate preserves both targets")
+                check(widget.fanSelected(widget.fans[0]) === 3000 && widget.fanSelected(widget.fans[1]) === 3000, "first Separate seeds current exact Linked targets")
                 widget.setFan(1, 2300)
                 widget.setFan(2, 2502, true)
                 stage = 3
@@ -48,7 +52,7 @@ Scope {
                 widget.chooseControlMode("shared")
                 stage = 4
             } else if (stage === 4) {
-                check(widget.savedControlMode === "shared" && widget.savedRpm === 2502 && !widget.separateControls, "Linked synchronizes to exact highest target without lowering")
+                check(widget.savedControlMode === "shared" && widget.savedRpm === 3000 && widget.savedLinkedRpm === 3000 && !widget.separateControls, "Linked restores its own saved target rather than using Separate maximum")
                 widget.setSpeed(4000)
                 stage = 40
             } else if (stage === 40) {
@@ -81,8 +85,8 @@ Scope {
                 widget.chooseControlMode("shared")
                 stage = 9
             } else if (stage === 9) {
-                check(widget.savedRpm === 5000 && widget.savedSeparateFans[0].rpm === 1600 && widget.savedSeparateFans[1].rpm === 5000, "Linked retains a distinct remembered Separate profile")
-                widget.setSpeed(4000)
+                check(widget.savedRpm === 4000 && widget.savedLinkedRpm === 4000 && widget.savedSeparateFans[0].rpm === 1600 && widget.savedSeparateFans[1].rpm === 5000, "Linked restores its lower bank without changing higher Separate speeds")
+                widget.setSpeed(3000)
                 stage = 10
             } else if (stage === 10) {
                 var linkedSlider = find(find(widget, "linked-fan-controls", []), "linked-target-slider", [])
@@ -96,7 +100,7 @@ Scope {
                 widget.chooseControlMode("shared")
                 stage = 11
             } else if (stage === 11) {
-                check(widget.savedControlMode === "shared" && widget.savedRpm === 5000 && !widget.separateControls, "Linked protects active restored 5000 from a canceled lower preview")
+                check(widget.savedControlMode === "shared" && widget.savedRpm === 3000 && widget.savedLinkedRpm === 3000 && !widget.separateControls, "explicit Linked restores its lower bank after active Separate and cancels fan edits")
                 widget.setSpeed(4000) // Keep a Shared command active while both edits queue.
                 widget.chooseControlMode("individual")
                 check(widget.fanSelected(widget.fans[0]) === 1600 && widget.fanSelected(widget.fans[1]) === 5000, "pending Separate previews the complete remembered profile")
@@ -105,9 +109,16 @@ Scope {
                 stage = 42
             } else if (stage === 42) {
                 check(widget.savedControlMode === "individual" && widget.fanSelected(widget.fans[0]) === 1600 && widget.fanSelected(widget.fans[1]) === 3500, "fan edits after Separate remain ordered and update memory")
-                widget.chooseControlMode("shared")
+                check(widget.savedLinkedRpm === 4000, "Separate fan edit cannot overwrite Linked bank")
+                widget.setSpeed(4400) // In-flight scalar update commits before restore.
+                widget.chooseControlMode("individual")
+                widget.chooseControlMode("shared") // Cancel unsent Separate, queue Linked.
+                check(widget.linkedSelectedRpm === 4400, "pending Linked predicts the newer in-flight scalar bank")
+                widget.setSpeed(4200) // Slider edit stays after queued Linked.
+                check(widget.pendingRequests.some(function(request) { return request.kind === "linked" }) && widget.pendingRequests.some(function(request) { return request.kind === "shared" }), "linked slider edit preserves prior queued restore")
                 stage = 43
             } else if (stage === 43) {
+                check(widget.savedRpm === 4200 && widget.savedLinkedRpm === 4200 && widget.savedSeparateFans[0].rpm === 1600 && widget.savedSeparateFans[1].rpm === 3500, "queued Linked then slider settles on the later scalar without changing Separate bank")
                 widget.setSpeed("auto")
                 widget.chooseControlMode("individual")
                 stage = 12
@@ -116,7 +127,7 @@ Scope {
                 widget.enableManual()
                 stage = 13
             } else if (stage === 13) {
-                check(widget.savedControlMode === "shared" && !widget.separateControls, "re-entering Manual after Auto defaults to Linked")
+                check(widget.savedControlMode === "shared" && widget.savedRpm === 4200 && !widget.separateControls, "Manual after Auto restores remembered Linked speed")
                 widget.setFan(1, 2000)
                 widget.chooseControlMode("shared")
                 widget.invalidate("fixture sensor failure while changing layouts")

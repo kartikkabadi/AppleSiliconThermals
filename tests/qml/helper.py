@@ -15,7 +15,7 @@ data = {'is_apple_silicon': True, 'has_fan': True, 'fan_count': 2,
         'mode': 'auto', 'broker_generation': '0' * 32, 'lease_owned': False,
         'persistent': True, 'per_fan_control': True, 'saved_mode': 'auto',
         'saved_control_mode': 'auto', 'saved_rpm': None, 'saved_fans': [],
-        'separate_memory': True, 'saved_separate_fans': [],
+        'separate_memory': True, 'saved_separate_fans': [], 'linked_memory': True, 'saved_linked_rpm': None,
         'fan_control_enabled': True, 'control_available': True,
         'max_temp': 0, 'power_watts': 0,
         'sensors': {'nand': 0, 'battery': None, 'regulator': 45.5, 'wifi': 41}}
@@ -39,7 +39,7 @@ else:
         print(json.dumps({'error': 'fixture command failure <img src="invalid">'}))
         sys.exit(9)
     if arguments and arguments[-1] == '5100':
-        reply = {key: data[key] for key in ('mode', 'persistent', 'per_fan_control', 'saved_mode', 'saved_control_mode', 'saved_rpm', 'saved_fans', 'separate_memory', 'saved_separate_fans')}
+        reply = {key: data[key] for key in ('mode', 'persistent', 'per_fan_control', 'saved_mode', 'saved_control_mode', 'saved_rpm', 'saved_fans', 'separate_memory', 'saved_separate_fans', 'linked_memory', 'saved_linked_rpm')}
         reply['saved_fans'] = [{'index': fan['index'], 'rpm': 5150 if fan['index'] == 1 else fan['rpm']} for fan in data['saved_fans']]
         print(json.dumps(reply))
         sys.exit(0)
@@ -51,6 +51,7 @@ else:
         data['saved_rpm'] = None if target == 'auto' else int(target)
         data['saved_fans'] = []
         if target != 'auto':
+            data['saved_linked_rpm'] = int(target)
             for fan in data['fans']:
                 fan['target'] = max(fan['min'], min(fan['max'], int(target)))
     elif action == 'set-fan':
@@ -67,6 +68,16 @@ else:
         data['saved_rpm'] = None
         data['saved_fans'] = [{'index': index, 'rpm': target} for index, target in sorted(targets.items())]
         data['saved_separate_fans'] = list(data['saved_fans'])
+    elif action == 'set-linked':
+        rpm = data['saved_linked_rpm']
+        if rpm is None:
+            rpm = max(max(fan['min'], min(fan['max'], fan['target'])) for fan in data['fans'])
+        data['mode'] = data['saved_mode'] = 'manual'
+        data['saved_control_mode'] = 'shared'
+        data['saved_rpm'] = data['saved_linked_rpm'] = rpm
+        data['saved_fans'] = []
+        for fan in data['fans']:
+            fan['target'] = max(fan['min'], min(fan['max'], rpm))
     elif action == 'set-separate':
         targets = {fan['index']: fan['rpm'] for fan in data['saved_separate_fans']}
         if not targets:
@@ -84,4 +95,4 @@ else:
     data['lease_owned'] = data['mode'] == 'manual'
     statefile.write_text(json.dumps(data))
     print(json.dumps({key: data[key] for key in ('mode', 'persistent', 'per_fan_control', 'saved_mode',
-                                                'saved_control_mode', 'saved_rpm', 'saved_fans', 'separate_memory', 'saved_separate_fans')}))
+                                                'saved_control_mode', 'saved_rpm', 'saved_fans', 'separate_memory', 'saved_separate_fans', 'linked_memory', 'saved_linked_rpm')}))

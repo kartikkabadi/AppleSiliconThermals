@@ -62,7 +62,11 @@ function parse(raw) {
     var memoryInventoryMatches = memory.fans.length === fans.length && fans.every(function(fan) { return memory.fans.some(function(target) { return target.index === fan.index }) })
     var memoryMatchesActive = savedControlMode !== "individual" || memory.fans.length === saved.fans.length && saved.fans.every(function(fan) { return memory.fans.some(function(target) { return target.index === fan.index && target.rpm === fan.rpm }) })
     var memoryValid = memory.valid && (!separateMemory || memoryMatchesActive)
-    preferenceValid = preferenceValid && memoryValid
+    var linkedMemory = data.linked_memory === true
+    var linkedRpm = linkedMemory ? integer(data.saved_linked_rpm, 1000, 7999) : null
+    var linkedMemoryValid = !linkedMemory || (data.saved_linked_rpm === null || linkedRpm !== null)
+        && (savedControlMode !== "shared" || linkedRpm === savedRpm)
+    preferenceValid = preferenceValid && memoryValid && linkedMemoryValid
     return {isAppleSilicon: data.is_apple_silicon === true, hasFan: data.has_fan === true,
         deviceModel: boundedText(data.device_model, 128), fans: fans, fanCount: fans.length,
         fanRpm: number(data.fan_rpm, 0, 100000), fanTarget: number(data.fan_target, 0, 100000),
@@ -87,6 +91,9 @@ function parse(raw) {
         savedSeparateFans: memory.fans,
         separateMemoryValid: memoryValid,
         separateRestoreAvailable: memoryValid && (memory.fans.length === 0 || memoryInventoryMatches),
+        linkedMemory: linkedMemory,
+        savedLinkedRpm: linkedRpm,
+        linkedMemoryValid: linkedMemoryValid,
         savedOwnerUid: integer(data.saved_owner_uid, 0, 4294967295),
         pausedReason: boundedText(data.paused_reason, 240),
         preferenceError: boundedText(data.preference_error, 240),

@@ -181,6 +181,52 @@ test('empty remembered history can seed a profile and unclaimed support is never
     assert.equal(data.preferenceValid, true);
   }
 });
+test('inactive Linked bank remains independent from higher Separate targets and Auto', () => {
+  const saved_fans = [{index: 1, rpm: 4500}, {index: 2, rpm: 5000}];
+  for (const active of [{saved_mode: 'auto', saved_control_mode: 'auto'},
+                       {saved_mode: 'manual', saved_control_mode: 'individual', saved_fans}]) {
+    const data = parse({...active, linked_memory: true, saved_linked_rpm: 2500});
+    assert.equal(data.linkedMemory, true);
+    assert.equal(data.linkedMemoryValid, true);
+    assert.equal(data.savedLinkedRpm, 2500);
+    assert.equal(data.preferenceValid, true);
+    assert.equal(data.controlEnabled, true);
+  }
+});
+test('active Linked scalar must match its remembered Linked bank', () => {
+  const active = {saved_mode: 'manual', saved_control_mode: 'shared', saved_rpm: 4000, linked_memory: true};
+  assert.equal(parse({...active, saved_linked_rpm: 4000}).preferenceValid, true);
+  for (const saved_linked_rpm of [null, 2500, 5000]) {
+    const data = parse({...active, saved_linked_rpm});
+    assert.equal(data.linkedMemoryValid, false);
+    assert.equal(data.preferenceValid, false);
+    assert.equal(data.controlEnabled, false);
+  }
+});
+test('claimed Linked bank rejects malformed or out-of-range scalar values', () => {
+  for (const saved_linked_rpm of [undefined, false, true, {}, [], '2500', 2500.5, 0, 999, 8000, -1]) {
+    const data = parse({linked_memory: true, saved_linked_rpm});
+    assert.equal(data.linkedMemoryValid, false);
+    assert.equal(data.preferenceValid, false);
+    assert.equal(data.controlEnabled, false);
+  }
+});
+test('null Linked bank explicitly represents first-use history without invalidating Auto', () => {
+  const data = parse({linked_memory: true, saved_linked_rpm: null});
+  assert.equal(data.linkedMemory, true);
+  assert.equal(data.linkedMemoryValid, true);
+  assert.equal(data.savedLinkedRpm, null);
+  assert.equal(data.preferenceValid, true);
+});
+test('legacy telemetry cannot fabricate Linked-memory support from a stray scalar', () => {
+  for (const linked_memory of [false, undefined, 'true', 1]) {
+    const data = parse({linked_memory, saved_linked_rpm: 4000});
+    assert.equal(data.linkedMemory, false);
+    assert.equal(data.savedLinkedRpm, null);
+    assert.equal(data.linkedMemoryValid, true);
+    assert.equal(data.preferenceValid, true);
+  }
+});
 test('fanless/error states cannot enable numeric controls', () => {
   assert.equal(parse({has_fan: false}).controlEnabled, false);
   assert.equal(parse({fans: [], has_fan: false}).controlEnabled, false);

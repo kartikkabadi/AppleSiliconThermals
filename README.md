@@ -8,10 +8,10 @@ supervised hardware override.
 This fork builds on [LukasMoriarty/AppleSiliconThermals](https://github.com/LukasMoriarty/AppleSiliconThermals)
 and retains its MIT license. Version 2 replaces the original shell telemetry and
 unbounded manual override with validated JSON and supervised fan control.
-Version 2.4 keeps your separate fan speeds saved while you use Linked, and
-restores them when you return to Separate. Your settings and layout survive
-bar restarts and reboot. Version 2.1 shared settings
-migrate without losing the saved choice.
+Version 2.5 remembers both your Linked speed and your Separate fan speeds.
+Switching layouts restores the settings saved for that layout. Both profiles
+and the active layout survive bar restarts and reboot. Older saved settings
+migrate without losing the active choice.
 
 ## Requirements and support
 
@@ -102,13 +102,15 @@ Manual mode offers **Linked** and **Separate** controls. Linked is the default
 for new manual settings: one slider and Quiet/Balanced/Max presets adjust both
 fans, clamped to each fan's hardware limits. Choose Separate for an individual
 slider and presets on each fan card. Adjusting one fan preserves the others.
-Switching to Linked uses the highest current target so no fan slows down;
-switching back to Separate restores the last individual targets you saved.
-Changing the Linked slider or presets does not replace that remembered pair.
-If you have never used Separate, its first selection starts from the current
-per-fan targets. Your selected layout and the remembered separate speeds are
-saved by the root service across shell restart and reboot. Auto pauses manual
-control while retaining the inactive Separate profile.
+Each layout has its own remembered settings. Switching to Linked restores your
+last Linked speed; switching to Separate restores the last individual targets
+you saved. Editing either layout preserves the other profile. A restored speed
+can be lower than the speed used in the other layout.
+
+On first use, Linked starts from the highest current fan target, and Separate
+starts from the current per-fan targets. The root service saves both profiles
+and your selected layout across shell restart and reboot. Auto retains both
+manual profiles. Returning to Manual restores the remembered Linked speed.
 
 The root control service maintains these settings independently of the widget
 and restores the active choice after service
@@ -123,7 +125,7 @@ The preference is an atomic, root-owned JSON file at:
 /var/lib/apple-silicon-fan-control/preference.json
 ```
 
-The file records mode, active targets, the remembered Separate targets, and the
+The file records mode, active targets, both remembered profiles, and the
 requesting account. It does not contain executable code or arbitrary paths. Writes include file and directory
 synchronization so an acknowledged choice is durable. Runtime state under
 `/run` is separate; discarding runtime state does not discard your preference.
@@ -132,16 +134,17 @@ safety pause retains the choice and explains why it is temporarily inactive.
 
 ### Upgrading existing saved settings
 
-Version 2.1/2.2/2.3 preferences migrate on read without rewriting their files.
-An active older Separate map also becomes the remembered Separate profile;
-an older Linked preference has no stored Separate history to recover.
-Schema 3 writes happen only after an explicit user setting change.
+Version 2.1–2.4 preferences migrate on read without rewriting their files.
+An older active Linked speed seeds the Linked profile; an older active Separate
+map seeds the Separate profile. Version 2.4 Separate memory is retained.
+History that older versions did not save starts empty. Schema 4 writes happen
+only after an explicit user setting change.
 The first individual adjustment captures the detected fan inventory and the
 other fans' desired, clamped targets, then saves the complete independent map.
 Numeric `helper.sh set <RPM>` remains available as a shared compatibility action;
 `helper.sh set-fan <index> <RPM>` changes one channel.
-`helper.sh set-separate` restores the remembered Separate profile in one verified
-transaction, rather than applying a partial sequence of fan edits. The root
+`helper.sh set-linked` and `helper.sh set-separate` restore the corresponding
+remembered profile in one verified transaction. The root
 interface accepts only indices 1–64 and bounded numeric RPM, never paths or executable arguments.
 
 Independent maps must match the detected inventory exactly. Missing or newly

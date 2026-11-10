@@ -102,12 +102,12 @@ elevate /usr/bin/install -o root -g root -m 755 -D "$source_dir/system/apple-sil
 elevate /usr/bin/systemctl enable apple-silicon-fan-watchdog.service apple-silicon-fan-sleep.service
 elevate /usr/bin/systemctl restart apple-silicon-fan-watchdog.service
 for attempt in {1..20}; do
-  if /usr/local/libexec/apple-silicon-fan-control status | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("ready") and s.get("mode") in ("auto","manual") and s.get("separate_memory") is True else 1)'; then
+  if /usr/local/libexec/apple-silicon-fan-control status | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("ready") and s.get("mode") in ("auto","manual") and s.get("separate_memory") is True and s.get("linked_memory") is True else 1)'; then
     break
   fi
   sleep 0.5
 done
-/usr/local/libexec/apple-silicon-fan-control status | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("ready") and s.get("mode") in ("auto","manual") and s.get("separate_memory") is True else "Supervisor did not establish a compatible known cooling state; no permission was granted")'
+/usr/local/libexec/apple-silicon-fan-control status | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("ready") and s.get("mode") in ("auto","manual") and s.get("separate_memory") is True and s.get("linked_memory") is True else "Supervisor did not establish a compatible known cooling state; no permission was granted")'
 elevate /usr/bin/install -o root -g root -m 440 -D "$scratch/policy" /etc/sudoers.d/apple-silicon-fan-control
 # Remove the obsolete boot-time unlock only after the supervised setup is ready.
 elevate /usr/bin/rm -f /etc/tmpfiles.d/macsmc-fan.conf

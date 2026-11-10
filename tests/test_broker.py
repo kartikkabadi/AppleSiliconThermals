@@ -549,14 +549,14 @@ class Fixture(unittest.TestCase):
         path.write_bytes(evidence)
         preference, error = broker.load_preference()
         self.assertIsNone(error)
-        self.assertEqual(preference['schema_version'], 3)
+        self.assertEqual(preference['schema_version'], 4)
         self.assertEqual(preference['control_mode'], 'shared')
         broker.watchdog_tick()
         self.assertEqual(broker.status()['mode'], 'manual')
         self.assertEqual(path.read_bytes(), evidence)
         broker.command('fan', fan_index=1, fan_rpm=3500)
         stored = json.loads(path.read_text())
-        self.assertEqual(stored['schema_version'], 3)
+        self.assertEqual(stored['schema_version'], 4)
         self.assertEqual(stored['control_mode'], 'individual')
 
     def test_cold_boot_restores_unequal_targets_and_keeps_saved_map(self):
@@ -733,7 +733,7 @@ class Fixture(unittest.TestCase):
         path.write_bytes(evidence)
         preference, error = broker.load_preference()
         self.assertIsNone(error)
-        self.assertEqual(preference['schema_version'], 3)
+        self.assertEqual(preference['schema_version'], 4)
         self.assertEqual(preference['fans'], preference['separate_fans'])
         broker.watchdog_tick()
         self.assertEqual(path.read_bytes(), evidence)
@@ -808,9 +808,154 @@ class Fixture(unittest.TestCase):
         broker.command('auto')
         preference, error = broker.load_preference()
         self.assertIsNone(error)
-        self.assertEqual(preference['schema_version'], 3)
+        self.assertEqual(preference['schema_version'], 4)
         self.assertEqual(preference['mode'], 'auto')
         self.assertEqual(preference['separate_fans'], [])
+
+
+    def test_linked_restores_lower_remembered_rpm_instead_of_raising_to_separate(self):
+        broker.command('2000')
+        broker.command('separate')
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        memory = [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 4700}]
+        self.assertEqual(broker.status()['saved_linked_rpm'], 2000)
+        for _ in range(3):
+            broker.command('linked')
+            state = broker.status()
+            self.assertTrue(state['linked_memory'])
+            self.assertEqual(state['saved_rpm'], 2000)
+            self.assertEqual(state['saved_linked_rpm'], 2000)
+            self.assertEqual(state['saved_separate_fans'], memory)
+            self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '2000')
+            self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '2000')
+            broker.command('separate')
+            self.assertEqual(broker.status()['saved_fans'], memory)
+            self.assertEqual(broker.status()['saved_linked_rpm'], 2000)
+
+    def test_first_linked_without_history_uses_highest_current_clamped_setpoint(self):
+        (self.hw / 'fan1_target').write_text('2317')
+        (self.hw / 'fan2_target').write_text('2502')
+        broker.command('linked')
+        self.assertEqual(broker.status()['saved_linked_rpm'], 2502)
+        self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '2502')
+        self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '2502')
+
+    def test_first_linked_seed_uses_planned_clamped_targets_not_unbounded_raw_requests(self):
+        broker.command('fan', fan_index=1, fan_rpm=7999)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        self.assertIsNone(broker.status()['saved_linked_rpm'])
+        broker.command('linked')
+        self.assertEqual(broker.status()['saved_linked_rpm'], 5779)
+        self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '5779')
+        self.assertEqual(broker.status()['saved_separate_fans'], [{'index': 1, 'rpm': 7999}, {'index': 2, 'rpm': 4700}])
+
+    def test_both_banks_survive_auto_cold_boot_sleep_and_service_release(self):
+        broker.command('2000')
+        broker.command('separate')
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        broker.command('auto')
+        evidence = (self.persistence / 'preference.json').read_bytes()
+        broker.command('sleep')
+        broker.command('resume')
+        broker.command('release')
+        with mock.patch.object(broker, 'boot_id', return_value='two-bank-reboot'):
+            broker.reset()
+            broker.watchdog_tick()
+            self.assertEqual(broker.status()['mode'], 'auto')
+            self.assertEqual(broker.status()['saved_linked_rpm'], 2000)
+            self.assertEqual(broker.status()['saved_separate_fans'], [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 4700}])
+            self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+            broker.command('linked')
+            self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '2000')
+            broker.command('separate')
+            self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '3500')
+            self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '4700')
+
+    def test_failed_linked_mode_save_keeps_both_banks_and_previous_separate_selection(self):
+        broker.command('2000')
+        broker.command('separate')
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        evidence = (self.persistence / 'preference.json').read_bytes()
+        with mock.patch.object(broker, 'save_preference', side_effect=OSError('disk full')):
+            with self.assertRaises(RuntimeError):
+                broker.command('linked')
+        self.assertEqual((self.persistence / 'preference.json').read_bytes(), evidence)
+        self.now += 31
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['control_mode'], 'individual')
+        self.assertEqual(broker.status()['saved_linked_rpm'], 2000)
+        self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '3500')
+        self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '4700')
+
+    def test_failed_new_linked_rpm_save_does_not_replace_remembered_scalar(self):
+        broker.command('2000')
+        broker.command('separate')
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        with mock.patch.object(broker, 'save_preference', side_effect=OSError('disk full')):
+            with self.assertRaises(RuntimeError):
+                broker.command('4500')
+        self.assertEqual(broker.status()['saved_linked_rpm'], 2000)
+        self.assertEqual(broker.status()['saved_separate_fans'], [{'index': 1, 'rpm': 2000}, {'index': 2, 'rpm': 4700}])
+
+    def test_schema_three_shared_migrates_linked_bank_read_only(self):
+        legacy = {'schema_version': 3, 'mode': 'manual', 'control_mode': 'shared',
+                  'rpm': 3000, 'fans': [], 'separate_fans': [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 4700}],
+                  'owner_uid': 0, 'generation': 'b' * 32}
+        path = self.persistence / 'preference.json'
+        evidence = json.dumps(legacy).encode()
+        path.write_bytes(evidence)
+        preference, error = broker.load_preference()
+        self.assertIsNone(error)
+        self.assertEqual(preference['schema_version'], 4)
+        self.assertEqual(preference['linked_rpm'], 3000)
+        broker.watchdog_tick()
+        self.assertEqual(path.read_bytes(), evidence)
+        broker.command('separate')
+        self.assertEqual(broker.status()['saved_linked_rpm'], 3000)
+        broker.command('linked')
+        self.assertEqual((self.hw / 'fan1_target').read_text().strip(), '3000')
+        self.assertEqual((self.hw / 'fan2_target').read_text().strip(), '3000')
+
+    def test_schema_three_individual_does_not_invent_unknown_linked_history(self):
+        legacy = {'schema_version': 3, 'mode': 'manual', 'control_mode': 'individual',
+                  'rpm': None, 'fans': [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 4700}],
+                  'separate_fans': [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 4700}],
+                  'owner_uid': 0, 'generation': 'c' * 32}
+        path = self.persistence / 'preference.json'
+        evidence = json.dumps(legacy).encode()
+        path.write_bytes(evidence)
+        preference, error = broker.load_preference()
+        self.assertIsNone(error)
+        self.assertIsNone(preference['linked_rpm'])
+        self.assertEqual(path.read_bytes(), evidence)
+
+    def test_schema_four_requires_valid_linked_memory_and_shared_equality(self):
+        shared = {'schema_version': 4, 'mode': 'manual', 'control_mode': 'shared',
+                  'rpm': 3000, 'fans': [], 'separate_fans': [], 'owner_uid': 0, 'generation': 'd' * 32}
+        with self.assertRaises(RuntimeError):
+            broker.validate_preference(shared)
+        for value in (None, True, '3000', 3000.5, 999, 8000, 4000):
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                broker.validate_preference({**shared, 'linked_rpm': value})
+        automatic = {**shared, 'mode': 'auto', 'control_mode': 'auto', 'rpm': None, 'owner_uid': None}
+        self.assertEqual(broker.validate_preference({**automatic, 'linked_rpm': 3000})['linked_rpm'], 3000)
+
+    def test_first_linked_can_recover_current_inventory_without_discarding_old_separate_bank(self):
+        broker.command('fan', fan_index=1, fan_rpm=3500)
+        broker.command('fan', fan_index=2, fan_rpm=4700)
+        for suffix in ('min', 'max', 'input', 'target'):
+            (self.hw / ('fan2_' + suffix)).rename(self.hw / ('fan3_' + suffix))
+        broker.watchdog_tick()
+        self.assertEqual(broker.status()['mode'], 'auto')
+        broker.command('linked')
+        self.assertEqual(broker.status()['control_mode'], 'shared')
+        self.assertEqual(broker.status()['saved_separate_fans'], [{'index': 1, 'rpm': 3500}, {'index': 2, 'rpm': 4700}])
+        with self.assertRaisesRegex(RuntimeError, 'inventory'):
+            broker.command('separate')
+        self.assertEqual(broker.status()['control_mode'], 'shared')
 
 
 
@@ -845,6 +990,16 @@ class Security(unittest.TestCase):
             broker.main()
             command.assert_called_once_with('separate', None, None, None)
         for arguments in (['separate', 'extra'], ['separate;id'], ['Separate']):
+            with self.subTest(arguments=arguments), mock.patch.object(broker.sys, 'argv', ['broker', *arguments]), mock.patch.object(broker, 'Hardware') as hardware:
+                with self.assertRaises(RuntimeError):
+                    broker.main()
+                hardware.assert_not_called()
+
+    def test_linked_cli_requires_exact_single_token(self):
+        with mock.patch.object(broker.sys, 'argv', ['broker', 'linked']), mock.patch.object(broker.os, 'geteuid', return_value=0), mock.patch.object(broker, 'command') as command, mock.patch.object(broker, 'status', return_value={}), contextlib.redirect_stdout(__import__('io').StringIO()):
+            broker.main()
+            command.assert_called_once_with('linked', None, None, None)
+        for arguments in (['linked', '2000'], ['linked;id'], ['Linked']):
             with self.subTest(arguments=arguments), mock.patch.object(broker.sys, 'argv', ['broker', *arguments]), mock.patch.object(broker, 'Hardware') as hardware:
                 with self.assertRaises(RuntimeError):
                     broker.main()

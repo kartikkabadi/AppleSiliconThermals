@@ -1,3 +1,26 @@
+# Version 2.5 independent Linked memory — 10 November 2026
+
+- Schema 4 adds a separate remembered Linked RPM. Linked edits update that bank;
+  Separate edits and Auto retain it. Switching to Linked restores it even when
+  it is lower than the Separate targets. First use without history uses the
+  highest current target.
+- The bounded, single-token `linked` action performs restoration under the same
+  lock and write verification as the other manual commands.
+- Schema 1/2/3 migration is read-only. Older active Linked settings seed the new
+  bank; the Separate memory introduced in schema 3 is retained.
+- All 177 Python tests (including five control QML cases and rendered icon motion)
+  and 34 JavaScript tests pass locally. Script syntax, Python compilation,
+  manifest validation, sudoers parsing and diff checks pass.
+- Tests cover distinct profiles and repeated round trips, restoring a lower
+  Linked RPM, exact bank validation, failed commits preserving both banks,
+  cold-boot and Auto retention, queued restores followed by edits, and rapid
+  layout cancellation. Independent review found no remaining blocker.
+- Permission probes are individually bounded at 0.6 seconds; four probes plus
+  the 1.5-second status read remain within the widget's 5-second read deadline.
+  Mutation deadlines are unchanged.
+
+---
+
 # Version 2.4 remembered Separate profile — 10 November 2026
 
 - Schema 3 stores inactive Separate targets independently of the active Linked

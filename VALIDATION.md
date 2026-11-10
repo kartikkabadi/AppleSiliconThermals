@@ -1,3 +1,41 @@
+# Version 2.1 persistence and UI validation — 10 November 2026
+
+Implementation: `f47c4f3`, authentication fix `ade5c71`, readability `cde2e97`.
+
+- 110 Python tests and 18 JavaScript tests pass locally. Python coverage includes
+  three headless QML cases. Both Ubuntu CI targets pass (QML skips when Omarchy
+  modules are not present).
+- Independent fixtures simulate a new boot ID and empty runtime directory while
+  retaining the durable preference; manual RPM is restored without a widget.
+- Additional checks cover long operation without UI heartbeats, internal release
+  preserving intent, explicit Auto transaction ordering, interrupted/failed saves,
+  restoration blocks, corrupted and insecure preferences, parent-directory fsync,
+  thermal hysteresis, pause/retry cooldowns, and restart/resume recovery.
+- Installer elevation routing is tested with mocks: sudo authentication failures
+  use pkexec without an unsupported separator; commands that ran and failed are
+  never executed again through pkexec.
+- Installed the persistent supervisor and root-owned preference on the M1 Pro.
+  The prior shared request of 6241 RPM was saved, with per-fan targets 5779/6241.
+- A real supervisor restart changed its process PID and restored that saved
+  manual request. A real Omarchy shell restart left the same preference and
+  manual control active. No UI heartbeat is required by version 2.1.
+- The popup was inspected on the live desktop: fan RPM/target cards, percent
+  bars, temperature/power cards, mode selector and remembered presets rendered.
+  Numeric readouts were increased after inspection for better readability.
+- New QML types did not replace an already compiled older widget during the
+  first hot update. A full shell restart loaded the new UI; README documents
+  this one-time upgrade requirement. Persistent fan control is independent of it.
+
+The machine was not rebooted or suspended during this work. Reboot restoration
+is covered by isolated cold-start fixtures; service and shell restarts were
+physically tested. Other Mac models/kernels remain unverified. Hardware faults
+can temporarily pause manual control while preserving the saved choice.
+
+---
+
+Earlier version 2.0 checks follow for history. Their lease-expiry behavior was
+intentionally replaced by service-owned persistent settings in version 2.1.
+
 # Validation: 10 November 2026
 
 Implementation commit: `97b5e83` (version 2.0.0).

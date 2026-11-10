@@ -47,7 +47,7 @@ elevate() {
   if grep -Eq '^sudo: (a password is required|a terminal is required|no tty present and no askpass program specified)' "$diagnostic"; then
     rm -f -- "$diagnostic"
     command -v pkexec >/dev/null || { echo 'Desktop authentication needs pkexec and a polkit agent.' >&2; return "$result"; }
-    pkexec -- "$@"
+    pkexec "$@"
   else
     rm -f -- "$diagnostic"
     return "$result"

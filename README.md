@@ -61,8 +61,10 @@ and `~/.config/omarchy/shell.json` before replacing it. The shell hot-reloads
 plugin files. When upgrading to a version with new QML components, run `omarchy restart shell` once
 after updating: Quickshell can retain older compiled widget components during
 a hot update that adds new QML types. The persistent control service keeps the
-saved fan setting independently of that restart. An existing legacy root helper must be upgraded separately using
-the optional setup below; installing the bar widget does not execute root code.
+saved fan setting independently of that restart. If manual control is installed,
+rerun `./setup.sh --enable-manual-control` after upgrading to 2.5.1 to install
+the updated root broker, service units and wake hook. Updating only the bar
+widget does not upgrade or execute root code.
 
 Use the popup to view each fan's actual speed, target and hardware limits.
 Monitoring-only installations display the fan mode as **unknown** because the

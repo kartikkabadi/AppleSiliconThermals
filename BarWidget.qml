@@ -43,6 +43,7 @@ BarWidget {
     property string savedControlMode: "unknown"
     property bool savedPreferenceValid: false
     property bool perFanControl: false
+    property string manualControlChoice: ""
     property string pausedReason: ""
     property string preferenceError: ""
     property bool leaseRecovering: false
@@ -52,7 +53,9 @@ BarWidget {
     readonly property int regularRpm: snapSpeed(fanMax * 0.5)
     readonly property int maxRpm: fanMax
     readonly property bool desiredManual: persistentControl && savedMode === "manual"
-    readonly property bool preferenceConfirmed: dataValid && !writeBusy && pendingRequests.length === 0 && persistentControl && savedPreferenceValid && preferenceError === ""
+    readonly property bool preferenceConfirmed: dataValid && !writeBusy && pendingRequests.length === 0 && persistentControl && savedPreferenceValid && preferenceError === "" && (manualControlChoice === "" || manualControlChoice === savedControlMode)
+    readonly property bool separateControls: manualControlChoice !== "" ? manualControlChoice === "individual" : desiredManual && savedControlMode === "individual"
+    readonly property int linkedSelectedRpm: selectedLinkedSpeed()
     readonly property string modeText: strings.t(leaseRecovering ? "recovering" : mode === "manual" ? "manual" : mode === "auto" ? "auto" : "unknown")
     readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
 
@@ -94,6 +97,7 @@ BarWidget {
         syncFanCards([])
         sensors = ({})
         leaseRecovering = false
+        manualControlChoice = ""
         readError = message
         warningText = ""
     }
@@ -167,10 +171,12 @@ BarWidget {
     function fanSelected(fan) {
         for (var pending = pendingRequests.length - 1; pending >= 0; pending--) {
             var request = pendingRequests[pending]
+            if (request.kind === "shared") return clampFanSpeed(fan, Number(request.args[1]))
             if (request.kind === "fan" && Number(request.args[1]) === fan.index) return clampFanSpeed(fan, Number(request.args[2]))
         }
         if (writeBusy && writeProc.activeRequest && writeProc.activeRequest.kind === "fan" && Number(writeProc.activeRequest.args[1]) === fan.index)
             return clampFanSpeed(fan, Number(writeProc.activeRequest.args[2]))
+        if (writeBusy && writeProc.activeRequest && writeProc.activeRequest.kind === "shared") return clampFanSpeed(fan, Number(writeProc.activeRequest.args[1]))
         if (savedControlMode === "individual") {
             for (var i = 0; i < savedFans.length; i++) if (savedFans[i].index === fan.index) return clampFanSpeed(fan, savedFans[i].rpm)
         }
@@ -181,11 +187,42 @@ BarWidget {
         return (writeBusy && writeProc.activeRequest && writeProc.activeRequest.kind === "auto")
             || pendingRequests.some(function(request) { return request.kind === "auto" })
     }
+    function highestDesiredSpeed() {
+        var highest = fanMin
+        for (var i = 0; i < fans.length; i++) {
+            var fan = fans[i]
+            var values = [fan.target, fanSelected(fan)]
+            if (savedControlMode === "shared") values.push(savedRpm)
+            else for (var j = 0; j < savedFans.length; j++) if (savedFans[j].index === fan.index) values.push(savedFans[j].rpm)
+            for (var k = 0; k < values.length; k++) {
+                var candidate = clampFanSpeed(fan, values[k])
+                if (candidate !== null) highest = Math.max(highest, candidate)
+            }
+        }
+        return Math.max(fanMin, Math.min(fanMax, highest))
+    }
+    function selectedLinkedSpeed() {
+        for (var i = pendingRequests.length - 1; i >= 0; i--) if (pendingRequests[i].kind === "shared") return Math.max(fanMin, Math.min(fanMax, Number(pendingRequests[i].args[1])))
+        if (writeBusy && writeProc.activeRequest && writeProc.activeRequest.kind === "shared") return Math.max(fanMin, Math.min(fanMax, Number(writeProc.activeRequest.args[1])))
+        return savedControlMode === "shared" && savedRpm !== null ? Math.max(fanMin, Math.min(fanMax, savedRpm)) : highestDesiredSpeed()
+    }
+    function chooseControlMode(choice) {
+        if (!fanControlEnabled || !dataValid || autoPending() || (choice !== "shared" && choice !== "individual")) return
+        if ((choice === "individual") === separateControls) return
+        var transfer = highestDesiredSpeed()
+        manualControlChoice = choice
+        pendingRequests = pendingRequests.filter(function(request) { return request.kind === "auto" })
+        if (choice === "shared") setSpeed(transfer)
+        else if (fans.length) {
+            var firstTarget = fanSelected(fans[0])
+            if (firstTarget !== null) setFan(fans[0].index, firstTarget, true)
+        }
+    }
     function enqueue(request) {
         if (request.kind === "auto") pendingRequests = [request]
         else {
             if (autoPending()) return
-            var queue = pendingRequests.filter(function(previous) { return previous.key !== request.key })
+            var queue = pendingRequests.filter(function(previous) { return previous.key !== request.key && (request.kind !== "shared" || previous.kind !== "fan") && (request.kind !== "fan" || previous.kind !== "shared") })
             queue.push(request)
             pendingRequests = queue
         }
@@ -196,35 +233,42 @@ BarWidget {
         if (!/^(auto|[1-7][0-9]{3})$/.test(value)) return
         if (value === "auto") {
             if (!controlAvailable) return
+            manualControlChoice = ""
             enqueue({kind:"auto",key:"auto",args:["set", "auto"]})
         } else {
             if (!fanControlEnabled || !dataValid || autoPending()) return
-            // Compatibility for existing callers; the visible controls use setFan.
+            manualControlChoice = "shared"
             enqueue({kind:"shared",key:"shared",args:["set", value]})
         }
     }
-    function setFan(index, rpm) {
+    function setFan(index, rpm, preserveExact) {
         var channel = Telemetry.integer(index, 1, 64)
         var value = Telemetry.integer(rpm, 1000, 7999)
         var fan = fanByIndex(channel)
         if (!fanControlEnabled || !perFanControl || !dataValid || !fan || value === null || autoPending()) return
-        value = snapFanSpeed(fan, value)
+        value = preserveExact === true ? clampFanSpeed(fan, value) : snapFanSpeed(fan, value)
+        manualControlChoice = "individual"
         enqueue({kind:"fan",key:"fan:" + channel,args:["set-fan", String(channel), String(value)]})
     }
     function enableManual() {
         if (!fanControlEnabled || autoPending()) return
-        // Each channel starts from its own saved or observed target.
-        for (var i = 0; i < fans.length; i++) setFan(fans[i].index, fanSelected(fans[i]))
+        if (desiredManual) return
+        if (manualControlChoice === "individual" && fans.length) setFan(fans[0].index, fanSelected(fans[0]), true)
+        else setSpeed(highestDesiredSpeed())
     }
     function retainAutoRecovery() {
         pendingRequests = pendingRequests.filter(function(request) { return request.kind === "auto" })
     }
     function startPending() {
         if (writeBusy || pendingRequests.length === 0) return
-        if (!dataValid || !fanControlEnabled || !perFanControl) retainAutoRecovery()
+        if (!dataValid || !fanControlEnabled || !perFanControl) {
+            retainAutoRecovery()
+            manualControlChoice = ""
+        }
         if (pendingRequests.length === 0) return
         writeBusy = true
-        if (readProc.running) { readProc.cancelled = true; readProc.running = false }
+        if (readBusy) readProc.cancelled = true
+        if (readProc.running) readProc.running = false
         var queue = pendingRequests.slice()
         writeProc.activeRequest = queue.shift()
         pendingRequests = queue
@@ -280,6 +324,7 @@ BarWidget {
             writeProc.timedOut = true
             writeProc.running = false
             root.controlError = strings.t("writeTimeout")
+            root.manualControlChoice = ""
             root.retainAutoRecovery()
             if (!writeProc.running) root.writeBusy = false
         }
@@ -297,6 +342,7 @@ BarWidget {
             writeDeadline.stop()
             Qt.callLater(function() {
                 if (code !== 0 || writeProc.timedOut) {
+                    root.manualControlChoice = ""
                     if (!writeProc.timedOut) {
                         var detail = writeProc.buffer.trim()
                         try { detail = JSON.parse(writeProc.output).error || detail } catch (error) {}
@@ -323,11 +369,13 @@ BarWidget {
                             root.savedPreferenceValid = true
                         } else root.savedPreferenceValid = false // Auto recovery works with older brokers too.
                     } catch (error) {
+                        root.manualControlChoice = ""
                         root.controlError = strings.t("writeFailed")
                         root.retainAutoRecovery()
                     }
                 }
                 root.writeBusy = false
+                if (root.pendingRequests.length === 0 && root.manualControlChoice === root.savedControlMode) root.manualControlChoice = ""
                 root.refresh()
                 root.startPending()
             })
@@ -344,25 +392,14 @@ BarWidget {
         tooltipText: Telemetry.escapeMarkup(strings.t("title") + ": " + (!root.dataValid ? (root.readError || strings.t("loading")) : root.hasFan ? strings.t("tooltip").arg(root.formatRpm(root.fanRpm)).arg(root.formatNumber(root.maxTemp, 1)) : strings.t("temperature").arg(root.formatNumber(root.maxTemp, 1))))
         onPressed: function(mouseButton) { if (mouseButton === Qt.LeftButton) root.togglePopup() }
         iconComponent: Component {
-            Item {
-                width: 16; height: 16
-                OpticalGlyph {
-                    id: fanGlyph
-                    anchors.fill: parent
-                    text: !root.dataValid ? "󰌺" : root.hasFan ? "󰈐" : "󰔏"
-                    color: button.foreground
-                    fontFamily: button.fontFamily
-                    fontSize: button.fontSize
-                    paintedSize: Style.bar.iconSize
-                    transform: Rotation { id: spin; origin.x: fanGlyph.paintedCenterX; origin.y: fanGlyph.paintedCenterY }
-                }
-                NumberAnimation {
-                    target: spin; property: "angle"; from: 0; to: 360
-                    duration: Math.max(1, Style.duration(Math.round(Math.max(180, Math.min(1200, 1200000 / Math.max(root.fanRpm || 1, 1))))))
-                    loops: Animation.Infinite
-                    easing.type: Easing.Linear
-                    running: root.spinIcon && !Style.reduceMotion && root.dataValid && root.hasFan && root.fanRpm > 0
-                }
+            FanIcon {
+                objectName: "thermal-bar-icon"
+                text: !root.dataValid ? "󰌺" : root.hasFan ? "󰈐" : "󰔏"
+                color: button.foreground
+                fontFamily: button.fontFamily
+                fontSize: button.fontSize
+                fan: root.dataValid && root.hasFan
+                spinning: root.spinIcon && root.fanRpm > 0
             }
         }
     }
@@ -465,7 +502,34 @@ BarWidget {
                             }
                         }
 
-                        ThermalText { width: parent.width; visible: root.desiredManual && root.preferenceConfirmed; text: "✓ " + strings.t("rememberedIndependent"); color: Commons.Color.muted }
+                        Column {
+                            width: parent.width
+                            visible: root.desiredManual && root.fanCount > 1
+                            spacing: Style.space(6)
+                            ThermalText { width: parent.width; text: strings.t("fanControlStyle"); color: Commons.Color.muted }
+                            Row {
+                                width: parent.width
+                                spacing: Style.space(6)
+                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("linked"); iconText: "󰌷"; focusable: true; selected: !root.separateControls; enabled: root.fanControlEnabled; onClicked: root.chooseControlMode("shared") }
+                                Button { width: (parent.width - parent.spacing) / 2; text: strings.t("separate"); iconText: "󰕮"; focusable: true; selected: root.separateControls; enabled: root.fanControlEnabled; onClicked: root.chooseControlMode("individual") }
+                            }
+                        }
+                        LinkedFanControls {
+                            objectName: "linked-fan-controls"
+                            width: parent.width
+                            visible: root.desiredManual && !root.separateControls
+                            bar: root.bar
+                            minimum: root.fanMin; maximum: root.fanMax
+                            targetRpm: root.linkedSelectedRpm
+                            controlsEnabled: root.fanControlEnabled
+                            title: strings.t(root.fanCount === 2 ? "targetBoth" : root.fanCount > 2 ? "targetAll" : "targetLabel")
+                            note: strings.t("linkedNote")
+                            minLabel: strings.t("minShort"); maxLabel: strings.t("maxShort")
+                            presetLabels: [strings.t("quiet"), strings.t("balanced"), strings.t("maximum")]
+                            formatValue: root.formatRpm
+                            onTargetRequested: function(rpm) { root.setSpeed(rpm) }
+                        }
+                        ThermalText { width: parent.width; visible: root.desiredManual && root.preferenceConfirmed; text: "✓ " + strings.t(root.separateControls ? "rememberedIndependent" : "remembered"); color: Commons.Color.muted }
                         ThermalText { width: parent.width; visible: !root.desiredManual && root.mode === "auto"; text: strings.t("automaticNote"); color: Commons.Color.muted }
                         ThermalText { width: parent.width; visible: !root.persistentControl || !root.controlAvailable; text: strings.t(root.persistentControl ? "controlUnavailable" : "setup"); color: Commons.Color.muted }
                         ThermalText { width: parent.width; visible: root.pausedReason !== ""; text: root.pausedReason; color: Commons.Color.urgent }
@@ -485,7 +549,7 @@ BarWidget {
                                 property int fanIndex: fanData.index
                                 objectName: "fan-control-" + fanIndex
                                 bar: root.bar
-                                manual: root.desiredManual
+                                manual: root.desiredManual && root.separateControls
                                 controlsEnabled: root.fanControlEnabled
                                 minimum: fanData.min !== null ? fanData.min : 1200
                                 maximum: fanData.max !== null ? fanData.max : 7200

@@ -62,6 +62,14 @@ class WidgetIntegrationTests(unittest.TestCase):
         actions = self.run_widget('restart.qml').splitlines()
         self.assertEqual(actions, ['set-fan 1 4000', 'set-fan 2 3000'])
 
+    def test_linked_separate_switches_are_durable_and_cancel_other_layout_edits(self):
+        actions = self.run_widget('control-modes.qml').splitlines()
+        self.assertEqual(actions[:2], ['set 2500', 'set-fan 1 2500'])
+        self.assertEqual(actions.count('set 2502'), 1)
+        self.assertEqual(actions.count('set-fan 1 2502'), 1)
+        self.assertNotIn('set-fan 2 1200', actions)
+        self.assertEqual(actions[:actions.index('set auto')].count('set 5000'), 1)
+
     def test_missing_executable_recovers_after_install(self):
         self.run_widget('recovery.qml', delayed_helper=True)
 

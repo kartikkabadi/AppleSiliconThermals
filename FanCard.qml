@@ -23,6 +23,14 @@ BorderSurface {
     property var presetLabels: ["Quiet", "Balanced", "Max"]
     property var formatValue: function(value) { return value === null ? "—" : String(Math.round(value)) }
     signal targetRequested(int rpm)
+    function resetGesture() {
+        if (!slider) return
+        slider.dragging = false
+        slider.liveValue = slider.value
+    }
+    onManualChanged: if (!manual) resetGesture()
+    onVisibleChanged: if (!visible) resetGesture()
+    onControlsEnabledChanged: if (!controlsEnabled) resetGesture()
     property color accent: Commons.Color.accent
     function snap(value) {
         var clamped = Math.max(minimum, Math.min(maximum, Number(value) || minimum))
@@ -74,8 +82,9 @@ BorderSurface {
                 enabled: card.controlsEnabled
                 activeFocusOnTab: true
                 Accessible.name: card.nameText + " " + card.targetLabel
-                onReleased: function(value) { card.targetRequested(card.snap(value)) }
+                onReleased: function(value) { if (card.visible && card.manual && card.controlsEnabled) card.targetRequested(card.snap(value)) }
                 Keys.onPressed: function(event) {
+                    if (!card.visible || !card.manual || !card.controlsEnabled) return
                     var key = Util.readingKey(event)
                     var value = key === Qt.Key_Left ? liveValue - step : key === Qt.Key_Right ? liveValue + step : key === Qt.Key_Home ? minimum : key === Qt.Key_End ? maximum : null
                     if (value !== null) { liveValue = card.snap(value); card.targetRequested(liveValue); event.accepted = true }
@@ -102,7 +111,7 @@ BorderSurface {
                         focusable: true
                         selected: card.targetRpm !== null && Math.abs(card.targetRpm - modelData) < 25
                         enabled: card.controlsEnabled
-                        onClicked: card.targetRequested(modelData)
+                        onClicked: if (card.visible && card.manual && card.controlsEnabled) card.targetRequested(modelData)
                     }
                 }
             }

@@ -1,3 +1,23 @@
+# Version 2.3 linked controls and icon polish — 10 November 2026
+
+- Linked manual controls provide one slider and Quiet/Balanced/Max presets.
+  Separate controls retain the independent sliders. The durable broker control
+  mode determines the layout after widget recreation.
+- Fan motion now accumulates frame time at a fixed rate, independent of RPM
+  polling. A rendering test changes RPM every 35 ms and checks phase continuity,
+  the unchanged 16-pixel slot and 4% glyph scale, pause/resume, stopped fans,
+  upright warning glyphs, and Omarchy's reduced-motion preference.
+- 140 Python tests (including five control QML cases and one rendered motion
+  case) and 24 JavaScript tests pass locally. Script syntax, Python compilation,
+  manifest validation and diff checks pass.
+- Mode-switch fixtures cover exact non-step targets, recreation in both layouts,
+  queued edit cancellation, no-lowering transfer, Auto precedence, safety aborts,
+  and release events from hidden or disabled sliders.
+- Hardware control, privilege policy and root service code are unchanged by 2.3.
+  Existing independent targets are preserved until the user selects Linked.
+
+---
+
 # Version 2.1 persistence and UI validation — 10 November 2026
 
 Implementation: `f47c4f3`, authentication fix `ade5c71`, readability `cde2e97`.

@@ -8,8 +8,9 @@ supervised hardware override.
 This fork builds on [LukasMoriarty/AppleSiliconThermals](https://github.com/LukasMoriarty/AppleSiliconThermals)
 and retains its MIT license. Version 2 replaces the original shell telemetry and
 unbounded manual override with validated JSON and supervised fan control.
-Version 2.2 gives each fan its own slider and remembered RPM across bar restarts
-and reboot. Version 2.1 shared settings migrate without losing the saved choice.
+Version 2.3 lets you choose linked or separate fan sliders, with remembered RPM
+and control layout across bar restarts and reboot. Version 2.1 shared settings
+migrate without losing the saved choice.
 
 ## Requirements and support
 
@@ -55,7 +56,7 @@ omarchy plugin enable io.github.lukasmoriarty.applesiliconthermals --section rig
 Do not install both upstream and this fork: the plugin ID is intentionally the
 same so an existing installation can be upgraded. Back up the existing checkout
 and `~/.config/omarchy/shell.json` before replacing it. The shell hot-reloads
-plugin files. When upgrading from 2.0 to 2.1, run `omarchy restart shell` once
+plugin files. When upgrading to a version with new QML components, run `omarchy restart shell` once
 after updating: Quickshell can retain older compiled widget components during
 a hot update that adds new QML types. The persistent control service keeps the
 saved fan setting independently of that restart. An existing legacy root helper must be upgraded separately using
@@ -96,8 +97,15 @@ Resolve the reported error before retrying, or use the uninstall procedure.
 
 ### Remembered mode and RPM
 
-Each fan card has its own slider and Quiet/Balanced/Max presets. Adjusting one
-fan saves its chosen RPM while preserving the other fan settings. The root control
+Manual mode offers **Linked** and **Separate** controls. Linked is the default
+for new manual settings: one slider and Quiet/Balanced/Max presets adjust both
+fans, clamped to each fan's hardware limits. Choose Separate for an individual
+slider and presets on each fan card. Adjusting one fan preserves the others.
+Switching to Linked uses the highest current target so no fan slows down;
+switching to Separate keeps the current targets. Your selected layout is saved
+with the manual targets and restored across shell restart and reboot.
+
+The root control
 service maintains it independently of the widget and restores it after service
 restart, shell restart, login and reboot. Closing the popup or disabling the
 widget does not change the saved choice. Choose **Auto** to save automatic
@@ -135,10 +143,12 @@ retaining the originally requested RPM in the saved preference.
 ### Hardware control and recovery
 
 - Requests are four-digit RPM values from 1000 through 7999. Each fan is clamped
-  to its own hardware range. Each slider and Max preset uses that fan's own
-  minimum and maximum.
+  to its own hardware range. Each separate slider and Max preset uses that fan's own
+  minimum and maximum. The linked slider uses the widest detected range; its
+  shared target is clamped independently on each channel.
 - These are fixed RPM settings, not temperature curves. Quiet and Balanced are
-  25% and 50% of each fan's own maximum, clamped to its range.
+  25% and 50% of the maximum, clamped to the range (per fan in Separate;
+  the highest fan maximum in Linked).
 - The broker serializes all writes and validates all channels before a change.
   A write journal marks incomplete changes as unknown so interrupted requests
   trigger recovery rather than leaving a false success state.
@@ -182,11 +192,13 @@ services must be upgraded before this widget enables numeric manual controls.
 
 Set `"spinIcon": false` in this widget's `bar.layout` entry in
 `~/.config/omarchy/shell.json` to disable the fan animation. The animation also
-follows Omarchy's reduce-motion preference. The popup scrolls to fit smaller
+follows Omarchy's reduce-motion preference. The fan glyph is 4% larger without
+changing the bar slot, and turns at a constant rate instead of changing speed
+with each RPM reading. The popup scrolls to fit smaller
 screens; it supports Escape and focusable controls. Fan cards distinguish
 current RPM from target RPM, while gauges show speed relative to each fan maximum.
-One Auto/Manual selector controls the overall mode. Manual sliders and presets
-live inside each fan card; component details can be expanded when needed. English strings are in
+One Auto/Manual selector controls the overall mode. A Linked/Separate selector
+chooses a shared slider or individual fan controls; component details can be expanded when needed. English strings are in
 `i18n/en.json`; the selected Omarchy language falls back to English until its
 catalog is supplied. Sensor/model names are displayed as plain text.
 
